@@ -383,6 +383,29 @@ const FILTERS = [
   v *= 1.-smoothstep(.2,.38,e);
   o = vec4(mix(vec3(.07,.07,.09), vec3(.97,.96,.92), v), 1.);` },
 
+{ id:'sincity', name:'Sin City', cat:'cartoon', blurb:'Hard-boiled black and white, except for one color that stays loud.',
+  params:[{label:'Color to keep',options:['Red','Yellow','Green','Blue'],val:0},{label:'Contrast',min:1,max:4,step:.05,val:2.4},{label:'Color range',min:.03,max:.2,step:.005,val:.08}],
+  fn:`
+  vec3 rgb2hsv(vec3 c){
+    vec4 K = vec4(0.,-1./3.,2./3.,-1.);
+    vec4 a = mix(vec4(c.bg,K.wz), vec4(c.gb,K.xy), step(c.b,c.g));
+    vec4 q = mix(vec4(a.xyw,c.r), vec4(c.r,a.yzx), step(a.x,c.r));
+    float d = q.x-min(q.w,q.y);
+    return vec3(abs(q.z+(q.w-q.y)/(6.*d+1e-10)), d/(q.x+1e-10), q.x);
+  }`,
+  body:`
+  vec3 c = texl(uv, .5);
+  float l = luma(c);
+  float g = smoothstep(.5-.5/P1, .5+.5/P1, l);
+  vec3 hsv = rgb2hsv(texl(uv, 1.));
+  float target = P0 < .5 ? 0. : (P0 < 1.5 ? .15 : (P0 < 2.5 ? .33 : .6));
+  float dh = abs(fract(hsv.x - target + .5) - .5);
+  float keep = smoothstep(P2, P2*.5, dh)*smoothstep(.18,.38,hsv.y)*smoothstep(.1,.22,hsv.z);
+  vec3 col = mix(vec3(g), clamp(sat(c,1.7)*1.15,0.,1.), keep);
+  col += (hash(p + fract(u_time)*300.)-.5)*.06;
+  vec2 a = uv-.5; col *= 1.-.55*dot(a,a);
+  o = vec4(clamp(col,0.,1.), 1.);` },
+
 /* ---------------- Fine Art ---------------- */
 { id:'sketch', name:'Pencil Sketch', cat:'art', blurb:'Graphite on cream paper, with cross-hatching in the shadows.',
   params:[{label:'Darkness',min:1,max:5,step:.1,val:2.2},{label:'Hatching',min:0,max:1,step:.01,val:.6},{label:'Colored pencil',min:0,max:1,step:.01,val:0}],
@@ -515,6 +538,46 @@ const FILTERS = [
   float lead = 1.-smoothstep(lw*.5, lw, v.y-v.x);
   o = vec4(mix(clamp(col,0.,1.), vec3(.08,.07,.07), lead), 1.);` },
 
+{ id:'topo', name:'Topo Map', cat:'art', blurb:'Brightness becomes elevation: contour lines, shaded relief and a map grid.',
+  params:[{label:'Contour lines',min:6,max:30,step:1,val:14},{label:'Map style',options:['Survey','Paper','Night'],val:0},{label:'Relief shading',min:0,max:1,step:.01,val:.6}],
+  fn:`
+  vec3 hyps(float t){
+    vec3 a = vec3(.56,.76,.89), b = vec3(.66,.82,.56), c = vec3(.85,.89,.64), d = vec3(.91,.83,.63), e = vec3(.77,.6,.42), f = vec3(.96,.95,.92);
+    t = clamp(t,0.,1.)*5.;
+    if(t < 1.) return mix(a,b,t);
+    if(t < 2.) return mix(b,c,t-1.);
+    if(t < 3.) return mix(c,d,t-2.);
+    if(t < 4.) return mix(d,e,t-3.);
+    return mix(e,f,t-4.);
+  }`,
+  body:`
+  float h = clamp((luma(texl(uv, 2.6))-.5)*1.2+.5, 0., 1.);
+  float e = h*P0;
+  float d = abs(fract(e+.5)-.5)/max(fwidth(e), 1e-4);
+  float idx = mod(floor(e+.5), 5.) < .5 ? 1. : 0.;
+  float L = max((1.-smoothstep(.6, 1.6, d))*.75, (1.-smoothstep(1.2, 2.4, d))*idx);
+  vec2 ex = vec2(4./u_res.x, 0.), ey = vec2(0., 4./u_res.y);
+  float dx = luma(texl(uv+ex,3.)) - luma(texl(uv-ex,3.));
+  float dy = luma(texl(uv+ey,3.)) - luma(texl(uv-ey,3.));
+  vec3 n = normalize(vec3(-dx*6., -dy*6., 1.));
+  float shade = clamp(dot(n, normalize(vec3(-.6,.6,.7))), 0., 1.);
+  float hs = mix(1., .55+.6*shade, P2);
+  float grid = 1.-step(1.2, min(mod(p.x, 96.), mod(p.y, 96.)));
+  vec3 col;
+  if(P1 < .5){
+    col = hyps(floor(e)/P0)*hs;
+    col = mix(col, vec3(.45,.27,.12), L);
+    col = mix(col, vec3(.25,.45,.75), grid*.35);
+  } else if(P1 < 1.5){
+    col = vec3(.96,.93,.85)*(.95+.05*vnoise(p*.6))*hs;
+    col = mix(col, vec3(.55,.3,.12), L*.9);
+    col = mix(col, vec3(.3,.5,.7), grid*.25);
+  } else {
+    col = vec3(.02,.04,.08) + vec3(0.,.08,.12)*shade*P2;
+    col += vec3(.2,.95,1.)*L*(.7+.3*idx) + vec3(.1,.3,.5)*grid*.25;
+  }
+  o = vec4(clamp(col,0.,1.), 1.);` },
+
 /* ---------------- Retro ---------------- */
 { id:'ascii', name:'ASCII', cat:'retro', blurb:'Your face rebuilt from typed characters, darkest to lightest.',
   params:[{label:'Character size',min:6,max:20,step:1,val:10,unit:'px'},{label:'Style',options:['Terminal','Color','Typewriter'],val:0},{label:'Contrast',min:.8,max:2.2,step:.05,val:1.3}],
@@ -634,6 +697,29 @@ const FILTERS = [
   if(P2 > .5){ float m = min(length(a-vec2(-.26,0.)), length(a-vec2(.26,0.))); col *= smoothstep(.47,.44,m); }
   o = vec4(clamp(col,0.,1.), 1.);` },
 
+{ id:'holo', name:'Hologram', cat:'lab', blurb:'A flickering, see-through projection, like a message from a galaxy far, far away.',
+  params:[{label:'Tint',options:['Blue','Green','Pink'],val:0},{label:'Brightness',min:.6,max:1.6,step:.01,val:1},{label:'Glitch',min:0,max:1,step:.01,val:.4}],
+  body:`
+  float t = u_time;
+  vec3 tint = P0 < .5 ? vec3(.3,.75,1.) : (P0 < 1.5 ? vec3(.35,1.,.55) : vec3(1.,.4,.85));
+  float gt = floor(t*12.);
+  float jit = step(1.-.08*P2, hash(vec2(gt, 1.)))*(hash(vec2(floor(uv.y*40.), gt))-.5)*.05;
+  jit += (vnoise(vec2(uv.y*30., t*2.))-.5)*.003*P2;
+  vec2 q = uv + vec2(jit, 0.);
+  float l = luma(texl(q, .8));
+  float e = smoothstep(.08, .4, sobel(q, 1.5, 1.));
+  float scan = .62 + .38*sin((p.y - t*60.)*1.3);
+  float roll = 1. + .7*smoothstep(.05, 0., abs(fract(uv.y - t*.22) - .5) - .02);
+  float flick = .88 + .12*hash(vec2(floor(t*24.), 3.));
+  float a = (l*.95 + e*.9)*scan*roll*flick;
+  vec3 holo = tint*a + vec3(.85,1.,1.)*e*.45;
+  holo.r += luma(texl(q + vec2(.004,0.), .8))*.12*P2;
+  holo.b += luma(texl(q - vec2(.004,0.), .8))*.12*P2;
+  float grid = 1.-step(1., min(mod(p.x, 40.), mod(p.y, 40.)));
+  vec3 bg = vec3(.015,.02,.045) + tint*grid*.05;
+  vec2 v = uv-.5;
+  o = vec4(clamp(bg + holo*P1*(1.-.6*dot(v,v)), 0., 1.), 1.);` },
+
 { id:'neon', name:'Neon Edges', cat:'lab', blurb:'Every edge traced in glowing, color-cycling neon tube.',
   params:[{label:'Glow',min:0,max:1.5,step:.01,val:.7},{label:'Color cycle',min:0,max:1,step:.01,val:.3},{label:'Background',min:0,max:1,step:.01,val:.15}],
   body:`
@@ -676,6 +762,35 @@ const FILTERS = [
   vec3 hc = hsv2rgb(vec3(fract(u_time*.12), .8, 1.));
   vec3 tr = max(texture(u_fb, uv).rgb*P0 - 1.5/255., 0.) + hc*m;
   o = vec4(min(tr, vec3(1.)), 1.);` },
+
+{ id:'fire', name:'On Fire', cat:'lab', blurb:'Flames rise off every edge of you. Move around to fan them.',
+  fb:true,
+  params:[{label:'Fuel',min:.3,max:1.5,step:.01,val:1},{label:'Flame height',min:.3,max:1.5,step:.01,val:1},{label:'Scene',min:0,max:1,step:.01,val:.55}],
+  body:`
+  float w = vnoise(p*.02 + vec2(0., -u_time*3.)) - .5;
+  vec2 src = uv - vec2(w*.006, .006*P1);
+  vec2 sx = vec2(1.5/u_res.x, 0.);
+  float h = (texture(u_fb, src).a + texture(u_fb, src+sx).a + texture(u_fb, src-sx).a)/3.;
+  h = max(h*(.955 - .03*vnoise(p*.05 + vec2(0., -u_time*2.))) - 1.5/255., 0.);
+  float e = smoothstep(.15, .45, sobel(uv, 1.5, 1.));
+  float m = smoothstep(.06, .18, length(texl(uv,1.) - textureLod(u_prev, uv, 1.).rgb));
+  h = clamp(max(h, (e*.55 + m)*P0*(.6 + .4*vnoise(p*.08 + u_time*4.))), 0., 1.);
+  float hh = h*1.25;
+  vec3 fire = vec3(clamp(hh*3.,0.,1.), clamp(hh*3.-1.,0.,1.), clamp(hh*3.-2.,0.,1.));
+  vec3 scene = texl(uv, .5)*(.35 + .65*P2)*(1.-.5*clamp(h*2.,0.,1.));
+  o = vec4(clamp(scene + fire, 0., 1.), h);` },
+
+{ id:'melt', name:'Melt', cat:'lab', blurb:'Everything slowly drips down the screen like hot wax. Move to reset the parts that melted.',
+  fb:true,
+  params:[{label:'Melt speed',min:0,max:1,step:.01,val:.5},{label:'Recover',min:0,max:1,step:.01,val:.15},{label:'Motion reset',min:0,max:1,step:.01,val:.8}],
+  body:`
+  vec3 cur = tex(uv);
+  float motion = smoothstep(.06, .16, length(texl(uv,1.) - textureLod(u_prev, uv, 1.).rgb));
+  float speed = .15 + pow(vnoise(vec2(p.x/11., 3.7)), 2.)*1.6 + vnoise(vec2(p.x/47., 9.1))*.6;
+  vec2 src = uv + vec2(sin(uv.y*18. + u_time)*.0004, speed*P0*.004);
+  vec4 fb = texture(u_fb, src);
+  vec3 m = (src.y > 1. || fb.a < .5) ? cur : fb.rgb;
+  o = vec4(mix(m, cur, max(motion*P2, P1*.04)), 1.);` },
 
 { id:'kaleido', name:'Kaleidoscope', cat:'lab', blurb:'A slowly turning mirror-tube view of whatever is in the middle of the frame.',
   params:[{label:'Mirrors',min:3,max:16,step:1,val:6},{label:'Spin',min:0,max:1,step:.01,val:.25},{label:'Zoom',min:.5,max:2,step:.01,val:1}],
@@ -812,7 +927,8 @@ function plainTex(){
 }
 const srcTex = plainTex();
 const blackTex = plainTex();
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,255]));
+// Alpha 0 = "no previous frame" for feedback filters (Melt, On Fire keep state in alpha).
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,0]));
 const dummyArr = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D_ARRAY, dummyArr);
 gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,255]));
@@ -849,7 +965,7 @@ function computeSize(sw, sh){
   return [Math.round(w/2)*2, Math.round(h/2)*2];
 }
 function clearOut(){
-  gl.clearColor(0, 0, 0, 1);
+  gl.clearColor(0, 0, 0, 0);
   outF.forEach(f => { gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.clear(gl.COLOR_BUFFER_BIT); });
 }
 function alloc(w, h){
