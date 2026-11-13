@@ -13,6 +13,7 @@
   --bg:#131217; --panel:#1a1920; --raise:#25232d; --line:#302d3a;
   --fg:#efedf4; --muted:#9a95a8; --stage:#0b0a0e; --on-c:#14121a;
   --cartoon:#ffc83d; --art:#ff7396; --retro:#45d0c1; --lab:#a98bff; --basic:#c9c5d3;
+  --hybrid:#a3e05c; --adv:#6aa8ff; --figure:#ff8d62;
   --rec:#ff4040;
   --f-display:'Syne','Arial Black',system-ui,sans-serif;
   --f-body:'Figtree',system-ui,-apple-system,'Segoe UI',sans-serif;
@@ -25,6 +26,7 @@
     --bg:#f2f1f5; --panel:#fbfafd; --raise:#e8e6ee; --line:#dad7e2;
     --fg:#1b1922; --muted:#666174; --stage:#17161c; --on-c:#ffffff;
     --cartoon:#a87200; --art:#c8335c; --retro:#0c7a6e; --lab:#6447d1; --basic:#55506a;
+    --hybrid:#4a7d12; --adv:#2f62c9; --figure:#b8501f;
     color-scheme:light;
   }
 }
@@ -261,6 +263,13 @@ const GB = ['#0f380f','#306230','#8bac0f','#9bbc0f', '#22231e','#5d5e52','#a3a49
             '#1a0000','#640000','#b30000','#ff3030', '#0b1a3a','#2a5d8c','#6fb4d6','#e2f6ff'];
 const ONEBIT = ['#0d0d0d','#f4f1e8', '#1a0d00','#ffb000', '#0a2a6b','#e8eef8', '#2b1b3d','#ff7eb6'];
 const GLYPHS = ' .:-=+*#%@';
+const CODE = '0123456789ZXKTHYAMEN:=+*<>|';
+const ATLAS_N = GLYPHS.length + 4 + CODE.length;
+const SPRITE = [
+  '#000000','#1d2b53','#7e2553','#008751','#ab5236','#5f574f','#c2c3c7','#fff1e8',
+  '#ff004d','#ffa300','#ffec27','#00e436','#29adff','#83769c','#ff77a8','#ffccaa',
+  '#1a1c2c','#5d275d','#b13e53','#ef7d57','#ffcd75','#a7f070','#38b764','#257179',
+  '#29366f','#3b5dc9','#41a6f6','#73eff7','#f4f4f4','#94b0c2','#566c86','#333c57'];
 
 /* ================= shader library ================= */
 const HEADER = `#version 300 es
@@ -299,7 +308,149 @@ float sobel(vec2 uv, float s, float lod){
 float bayer2(vec2 a){ a = floor(a); return fract(a.x/2. + a.y*a.y*.75); }
 #define bayer4(a) (bayer2(.5*(a))*.25 + bayer2(a))
 #define bayer8(a) (bayer4(.5*(a))*.25 + bayer2(a))
+// multi-pass support: pre-pass outputs live in the corner of a scratch texture (u_psN.xy = size, .zw = share of the texture)
+uniform sampler2D u_pass0, u_pass1, u_pass2;
+uniform vec4 u_ps0, u_ps1, u_ps2;
+uniform vec2 u_outRes;
+uniform float u_lod0;
+vec4 pass0(vec2 uv){ return texture(u_pass0, clamp(uv, .5/u_ps0.xy, 1.-.5/u_ps0.xy)*u_ps0.zw); }
+vec4 pass1(vec2 uv){ return texture(u_pass1, clamp(uv, .5/u_ps1.xy, 1.-.5/u_ps1.xy)*u_ps1.zw); }
+vec4 pass2(vec2 uv){ return texture(u_pass2, clamp(uv, .5/u_ps2.xy, 1.-.5/u_ps2.xy)*u_ps2.zw); }
+const float ATLAS_N = ${ATLAS_N}., EDGE0 = ${GLYPHS.length}., CODE0 = ${GLYPHS.length + 4}., CODE_N = ${CODE.length}.;
+float glyph(float i, vec2 lu, float cw){ return textureLod(u_glyph, vec2((i + clamp(lu.x, .03, .97))/ATLAS_N, lu.y), max(0., log2(40./cw) - .5)).r; }
+float segd(vec2 q, vec2 a, vec2 b){ vec2 pa = q-a, ba = b-a; float h = clamp(dot(pa,ba)/max(dot(ba,ba), 1e-6), 0., 1.); return length(pa - ba*h); }
 `;
+
+/* ---- shared pieces for the flow-field filters (Painterly, Flow Ink, Ink & Paint, Life Drawing) ----
+   pass 0: colour structure tensor at half size; pass 1: Gaussian-smoothed tensor;
+   pass 2: 1D difference of Gaussians across the local edge direction (P0 = line weight). */
+const FLOW_LIB = `
+vec4 flowFrom(vec4 s){
+  float a = s.x*3., b = s.y*3., c = (s.z - .5)*6.;
+  float root = sqrt((a - b)*(a - b) + 4.*c*c);
+  float l1 = .5*(a + b + root), l2 = .5*(a + b - root);
+  vec2 t = vec2(l1 - a, -c);
+  float tl = length(t);
+  t = tl > 1e-8 ? t/tl : vec2(0., 1.);
+  float A = l1 + l2 > 1e-8 ? (l1 - l2)/(l1 + l2) : 0.;
+  return vec4(t, A, sqrt(max(l1, 0.)));
+}
+vec4 flowAt(vec2 uv){ return flowFrom(pass1(uv)); }
+vec4 licDoG(vec2 uv, float sm){
+  vec2 t0 = flowAt(uv).xy;
+  vec4 acc = pass2(uv); float ws = 1.;
+  for(int s = 0; s < 2; s++){
+    vec2 x = uv, tp = s == 0 ? t0 : -t0;
+    for(int i = 1; i <= 8; i++){
+      vec2 t = flowAt(x).xy;
+      t = dot(t, tp) < 0. ? -t : t;
+      x += t/u_res;
+      tp = t;
+      float w = exp(-float(i*i)/(2.*sm*sm));
+      acc += w*pass2(x); ws += w;
+    }
+  }
+  return acc/ws;
+}
+// g = (narrow-blurred luma, per-channel log DoG). Strength of the dark side of an edge, in log contrast:
+// luma edges, and colour edges whose brightness barely changes (skin against sky), both register.
+float inkD(vec4 g){
+  vec3 D = (g.yzw - .5)*4.;
+  float dl = dot(D, vec3(.299,.587,.114));
+  return max(-dl, length(min(D, 0.))*.8*(1. - smoothstep(0., .015, dl)));
+}
+// 1 = paper, 0 = ink. thr: line threshold in log contrast; eps: tones darker than this fill solid.
+float inkLine(vec4 g, float thr, float eps){
+  float line = smoothstep(thr*.6, thr*1.4, inkD(g));
+  float fill = smoothstep(eps + .05, eps - .05, g.x);
+  return (1. - line)*(1. - fill);
+}
+`;
+// Anisotropic Kuwahara with polynomial sector weights (Kyprianidis et al.): eight sectors of an
+// ellipse stretched along the local edge; the flattest sectors win, so strokes follow the edges.
+const KUWA_LIB = `
+vec3 kuwahara(vec2 uv, float radius, float q, float alpha){
+  vec4 fl = flowAt(uv);
+  float A = fl.z, cp = fl.x, sp = fl.y;
+  float a = radius*clamp((alpha + A)/alpha, .1, 2.);
+  float b = radius*clamp(alpha/(alpha + A), .1, 2.);
+  float stp = radius > 3.25 ? 2. : 1.;
+  int mx = int(ceil(sqrt(a*a*cp*cp + b*b*sp*sp)/stp));
+  int my = int(ceil(sqrt(a*a*sp*sp + b*b*cp*cp)/stp));
+  float zeta = 2./radius;
+  float zc = .58, szc = sin(zc);
+  float eta = (zeta + cos(zc))/(szc*szc);
+  float lod = u_lod0 + log2(stp)*.8;
+  vec4 m[8]; vec3 s[8];
+  for(int k = 0; k < 8; k++){ m[k] = vec4(0.); s[k] = vec3(0.); }
+  for(int y = -my; y <= my; y++){
+    for(int x = -mx; x <= mx; x++){
+      vec2 off = vec2(float(x), float(y))*stp;
+      vec2 v = vec2(cp*off.x + sp*off.y, -sp*off.x + cp*off.y)/vec2(2.*a, 2.*b);
+      if(dot(v, v) <= .25){
+        vec3 c = clamp(texl(uv + off/u_res, lod), 0., 1.);
+        float w[8];
+        float vxx = zeta - eta*v.x*v.x, vyy = zeta - eta*v.y*v.y, z;
+        z = max(0., v.y + vxx); w[0] = z*z;
+        z = max(0., -v.x + vyy); w[2] = z*z;
+        z = max(0., -v.y + vxx); w[4] = z*z;
+        z = max(0., v.x + vyy); w[6] = z*z;
+        vec2 v2 = .70710678*vec2(v.x - v.y, v.x + v.y);
+        vxx = zeta - eta*v2.x*v2.x; vyy = zeta - eta*v2.y*v2.y;
+        z = max(0., v2.y + vxx); w[1] = z*z;
+        z = max(0., -v2.x + vyy); w[3] = z*z;
+        z = max(0., -v2.y + vxx); w[5] = z*z;
+        z = max(0., v2.x + vyy); w[7] = z*z;
+        float sum = 0.;
+        for(int k = 0; k < 8; k++) sum += w[k];
+        float g = exp(-3.125*dot(v, v))/max(sum, 1e-8);
+        for(int k = 0; k < 8; k++){ float wk = w[k]*g; m[k] += vec4(c*wk, wk); s[k] += c*c*wk; }
+      }
+    }
+  }
+  vec4 acc = vec4(0.);
+  for(int k = 0; k < 8; k++){
+    vec3 mu = m[k].rgb/max(m[k].w, 1e-8);
+    vec3 va = abs(s[k]/max(m[k].w, 1e-8) - mu*mu);
+    float wk = 1./(1. + pow(4000.*(va.r + va.g + va.b), .5*q));
+    acc += vec4(mu*wk, wk);
+  }
+  return acc.rgb/max(acc.w, 1e-8);
+}
+`;
+const halfSize = (w, h) => [Math.ceil(w/2), Math.ceil(h/2)];
+const TENSOR_PASS = {size:halfSize, body:`
+  vec2 d = 2./u_res;
+  float lod = 1. + u_lod0;
+  vec3 tl = texl(uv+vec2(-d.x, d.y), lod), tc = texl(uv+vec2(0., d.y), lod), tr = texl(uv+d, lod);
+  vec3 ml = texl(uv-vec2(d.x,0.), lod), mr = texl(uv+vec2(d.x,0.), lod);
+  vec3 bl = texl(uv-d, lod), bc = texl(uv-vec2(0.,d.y), lod), br = texl(uv+vec2(d.x,-d.y), lod);
+  vec3 gx = ((tr + 2.*mr + br) - (tl + 2.*ml + bl))*.25;
+  vec3 gy = ((tl + 2.*tc + tr) - (bl + 2.*bc + br))*.25;
+  o = vec4(dot(gx,gx)/3., dot(gy,gy)/3., dot(gx,gy)/6. + .5, 1.);`};
+const TBLUR_PASS = {size:halfSize, body:`
+  vec2 px = 1./u_outRes;
+  vec4 acc = vec4(0.); float ws = 0.;
+  for(int j = -3; j <= 3; j++) for(int i = -3; i <= 3; i++){
+    float w = exp(-float(i*i + j*j)/8.);
+    acc += w*pass0(uv + vec2(float(i), float(j))*px);
+    ws += w;
+  }
+  o = acc/ws;`};
+const DOGX_PASS = {fn:FLOW_LIB, body:`
+  vec4 fl = flowAt(uv);
+  vec2 n = vec2(fl.y, -fl.x);
+  float s1 = P0, s2 = P0*1.6;
+  int R = int(ceil(s2*2.));
+  vec3 g1 = vec3(0.), g2 = vec3(0.); vec2 ws = vec2(0.); float lin = 0.;
+  for(int i = -R; i <= R; i++){
+    float x = float(i);
+    vec3 c = texl(uv + n*x/u_res, u_lod0);
+    vec3 lc = log(c + .05);
+    vec2 w = exp(-x*x/(2.*vec2(s1*s1, s2*s2)));
+    g1 += w.x*lc; g2 += w.y*lc; lin += w.x*luma(c); ws += w;
+  }
+  o = vec4(lin/ws.x, (g1/ws.x - g2/ws.y)*.25 + .5);`};
 
 const FILTERS = [
 { id:'original', name:'Original', cat:'basic', blurb:'The unfiltered feed. Handy as a reference.', params:[],
@@ -589,7 +740,7 @@ const FILTERS = [
   float l = clamp((luma(c)-.5)*P2+.5, 0., 1.);
   float lg = P1 > 1.5 ? 1.-l : l;
   float gi = floor(lg*(u_glyphN-1.)+.5);
-  float g = texture(u_glyph, vec2((gi+lu.x)/u_glyphN, lu.y)).r;
+  float g = glyph(gi, lu, cp.x);
   vec3 col;
   if(P1 < .5) col = mix(vec3(.02,.06,.04), vec3(.4,1.,.55)*(.55+.45*l), g);
   else if(P1 < 1.5) col = mix(vec3(.03), clamp(sat(c,1.4)*1.25,0.,1.), g);
@@ -821,18 +972,507 @@ const FILTERS = [
   else if(P0 < 2.5){ if(r < R){ float k = 1.-r/R; float an = P1*5.*k*k; float cs = cos(an), sn = sin(an); q = mat2(cs,-sn,sn,cs)*a; } }
   else q = a + vec2(sin(a.y*11.+u_time*3.), cos(a.x*9.+u_time*2.4))*.035*P1;
   o = vec4(tex(clamp(q/asp + .5, 0., 1.)), 1.);` },
+
+/* ---------------- Hybrid ---------------- */
+{ id:'edgeascii', name:'Edge ASCII', cat:'hybrid', blurb:'Line detection meets ASCII. Contours turn into | / — \\ strokes that follow the edges, and typed characters shade everything else.',
+  params:[{label:'Character size',min:6,max:20,step:1,val:10,unit:'px'},{label:'Line detail',min:0,max:1,step:.01,val:.55},{label:'Style',options:['Terminal','Color','Paper','Lines only'],val:0}],
+  // pre-pass, one pixel per character cell: vote on edge direction with a colour structure tensor
+  passes:[{size:(w, h, f) => [w/uval(f, 0), h/(uval(f, 0)*1.6)], body:`
+  vec2 cp = vec2(P0, P0*1.6);
+  vec2 cell = floor(gl_FragCoord.xy);
+  float st = max(1., P0*.14);
+  float lod = log2(st) + .3 + u_lod0;
+  vec2 d = st/u_res;
+  float thr = mix(.32, .05, P1);
+  vec3 J = vec3(0.); float hits = 0.;
+  for(int j = 0; j < 8; j++) for(int i = 0; i < 5; i++){
+    vec2 q = (cell + (vec2(float(i), float(j)) + .5)/vec2(5., 8.))*cp/u_res;
+    vec3 tl = texl(q+vec2(-d.x, d.y), lod), tc = texl(q+vec2(0., d.y), lod), tr = texl(q+d, lod);
+    vec3 ml = texl(q-vec2(d.x,0.), lod), mr = texl(q+vec2(d.x,0.), lod);
+    vec3 bl = texl(q-d, lod), bc = texl(q-vec2(0.,d.y), lod), br = texl(q+vec2(d.x,-d.y), lod);
+    vec3 gx = ((tr + 2.*mr + br) - (tl + 2.*ml + bl))*.25;
+    vec3 gy = ((tl + 2.*tc + tr) - (bl + 2.*bc + br))*.25;
+    float w = smoothstep(thr, thr*1.7, sqrt(dot(gx,gx) + dot(gy,gy)));
+    J += w*vec3(dot(gx,gx), dot(gy,gy), dot(gx,gy));
+    hits += w;
+  }
+  float cov = hits/40.;
+  float coh = sqrt((J.x-J.y)*(J.x-J.y) + 4.*J.z*J.z)/max(J.x + J.y, 1e-6);
+  float ang = .5*atan(2.*J.z, J.x - J.y);
+  float aa = abs(ang);
+  float b = aa < PI/8. ? 1. : (aa > 3.*PI/8. ? 2. : (ang > 0. ? 4. : 3.));
+  o = vec4((cov > .12 && coh > .35 ? b : 0.)/4., cov, coh, 1.);`}],
+  body:`
+  vec2 cp = vec2(P0, P0*1.6);
+  vec2 cell = floor(p/cp);
+  vec2 lu = fract(p/cp);
+  float eb = floor(texelFetch(u_pass0, ivec2(cell), 0).x*4. + .5);
+  vec3 c = texl((cell + .5)*cp/u_res, max(0., log2(P0) - .5) + u_lod0);
+  float l = clamp((luma(c) - .5)*1.3 + .5, 0., 1.);
+  int st = int(P2 + .5);
+  float gi = floor((st == 2 ? 1. - l : l)*(u_glyphN - 1.) + .5);
+  float ge = eb > .5 ? glyph(EDGE0 + eb - 1., lu, cp.x) : 0.;
+  float gf = (eb > .5 || st == 3) ? 0. : glyph(gi, lu, cp.x);
+  vec3 sc = clamp(sat(c, 1.5)*1.25, 0., 1.);
+  vec3 hue = sc/max(max(sc.r, sc.g), max(sc.b, .15));
+  vec3 bg, fc, ec;
+  if(st == 0){ bg = vec3(.02,.05,.035); fc = vec3(.3,.92,.48)*(.4 + .6*l); ec = vec3(.82,1.,.86); }
+  else if(st == 1){ bg = vec3(.03); fc = sc*.9; ec = mix(hue, vec3(1.), .45); }
+  else if(st == 2){ bg = vec3(.96,.94,.89); fc = vec3(.4,.4,.48); ec = vec3(.08,.07,.12); }
+  else { bg = vec3(.012,.012,.025); fc = vec3(0.); ec = mix(hue, vec3(1.), .25); }
+  o = vec4(mix(mix(bg, fc, gf), ec, ge), 1.);` },
+
+{ id:'matrix', name:'Matrix Code', cat:'hybrid', blurb:'Falling streams of glowing code. Your picture lights up in the characters, brightest where the rain passes.',
+  params:[{label:'Character size',min:8,max:22,step:1,val:13,unit:'px'},{label:'Rain speed',min:.2,max:2.5,step:.05,val:1},{label:'Picture',min:0,max:1,step:.01,val:.75}],
+  body:`
+  vec2 cp = vec2(P0, P0*1.6);
+  vec2 cell = floor(p/cp);
+  vec2 lu = fract(p/cp);
+  vec2 cuv = (cell + .5)*cp/u_res;
+  float lod = max(0., log2(P0) - .5) + u_lod0;
+  float l = luma(texl(cuv, lod));
+  float e = sobel(cuv, P0*.6, lod);
+  float rows = ceil(u_res.y/cp.y);
+  float yt = rows - 1. - cell.y;
+  float rain = 0., head = 0.;
+  for(int k = 0; k < 2; k++){
+    vec2 cs = vec2(cell.x, float(k)*17.31);
+    float spd = mix(5., 13., hash(cs + .7))*P1;
+    float len = mix(7., 26., hash(cs + 3.1));
+    float per = rows + len + mix(4., 40., hash(cs + 5.3));
+    float d = mod(u_time*spd + hash(cs + 9.7)*per, per) - yt;
+    if(d >= 0. && d < len){ rain = max(rain, pow(1. - d/len, 1.5)); if(d < 1.) head = 1.; }
+  }
+  float tk = floor(u_time*(head > .5 ? 16. : mix(.5, 6., hash(cell*1.37))) + hash(cell)*7.);
+  float gi = floor(hash(cell + tk*.613)*CODE_N);
+  vec2 glu = hash(cell*2.71 + 1.3) > .5 ? vec2(1. - lu.x, lu.y) : lu;
+  float g = glyph(CODE0 + gi, glu, cp.x);
+  float lb = luma(texl(cuv, lod + 2.5));
+  float pic = clamp(smoothstep(.12, .9, l)*.6 + (l - lb)*2. + e*.9, 0., 1.);
+  pic = pic*pic*(3. - 2.*pic);
+  float b = mix(rain, pic*(.5 + .5*rain), P2);
+  vec3 col = vec3(.12,1.,.38)*b*g*1.15 + vec3(.8,1.,.85)*head*g + vec3(.02,.12,.05)*b;
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'inkpaint', name:'Ink & Paint', cat:'hybrid', blurb:'Brush strokes that follow the shape of things, inked over with flowing contour lines. A graphic-novel panel.',
+  params:[{label:'Line weight',min:.6,max:2.2,step:.05,val:1.1,unit:'px'},{label:'Brush size',min:2,max:7,step:.5,val:4},{label:'Ink',min:0,max:1,step:.01,val:.55}],
+  passes:[TENSOR_PASS, TBLUR_PASS, DOGX_PASS],
+  fn: FLOW_LIB + KUWA_LIB,
+  body:`
+  vec3 paint = clamp(sat(kuwahara(uv, P1, 8., 1.), 1.2), 0., 1.);
+  paint *= mix(.94, 1.06, smoothstep(.2, .8, luma(paint)));
+  float e = inkLine(licDoG(uv, 3.), mix(.05, .012, P2), mix(0., .1, P2));
+  o = vec4(mix(vec3(.06,.05,.09), paint, e), 1.);` },
+
+{ id:'hologlitch', name:'Holo Glitch', cat:'hybrid', blurb:'Glowing edge detection, scanlines and signal glitches combined into a flickering sci-fi projection.',
+  params:[{label:'Edge glow',min:0,max:1.5,step:.01,val:.8},{label:'Glitch',min:0,max:1,step:.01,val:.35},{label:'Color',options:['Cyan','Emerald','Rose','Amber'],val:0}],
+  body:`
+  float t = u_time;
+  float slice = floor(uv.y*26.), tick = floor(t*8.);
+  float on = step(1. - .3*P1, hash(vec2(slice, tick)));
+  float sh = on*(hash(vec2(tick, slice + 5.)) - .5)*.09*P1 + (vnoise(vec2(t*2.7, uv.y*3.)) - .5)*.006*P1;
+  vec2 q = uv + vec2(sh, 0.);
+  float lod = .8 + u_lod0;
+  float L = luma(texl(q, lod));
+  float Lr = luma(texl(q + vec2(.0035, 0.), lod)), Lb = luma(texl(q - vec2(.0035, 0.), lod));
+  float e1 = sobel(q, 1.2, lod), e2 = sobel(q, 4.5, 2.5 + u_lod0);
+  int ci = int(P2 + .5);
+  vec3 hc = ci == 0 ? vec3(.2,.8,1.) : ci == 1 ? vec3(.2,1.,.55) : ci == 2 ? vec3(1.,.35,.7) : vec3(1.,.7,.2);
+  float scan = .72 + .28*sin(p.y*2.1 - t*12.);
+  float sweep = exp(-pow((fract(uv.y*.55 + t*.16) - .5)*10., 2.));
+  vec3 col = hc*pow(L, 1.5)*.85*scan;
+  col += mix(hc, vec3(1.), .55)*smoothstep(.1, .45, e1)*P0 + hc*e2*.6*P0;
+  col += max(vec3(Lr - L, 0., Lb - L), 0.)*1.4;
+  col *= (1. + .55*sweep)*(.86 + .14*hash(vec2(floor(t*18.), 3.)));
+  vec2 gq = fract(p/28.)*28.;
+  col += hc*(.035*(1. - min(smoothstep(0., 1.2, gq.x), smoothstep(0., 1.2, gq.y))) + .02);
+  col *= 1. + on*.5*P1;
+  vec2 a = uv - .5; col *= 1. - .8*dot(a, a);
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'riso', name:'Riso Print', cat:'hybrid', blurb:'A two-ink risograph. The picture is split into two colored halftone layers, printed slightly out of register on grainy paper.',
+  params:[{label:'Dot size',min:3,max:10,step:.5,val:5,unit:'px'},{label:'Misregister',min:0,max:1,step:.01,val:.45},{label:'Inks',options:['Pink + Blue','Red + Teal','Orange + Navy','Yellow + Purple'],val:0}],
+  fn:`
+  vec2 risoSplit(vec3 c, vec3 A, vec3 B){
+    vec3 da = -log(max(A, .03)), db = -log(max(B, .03)), dc = -log(clamp(c, .03, 1.));
+    float aa = dot(da, da), bb = dot(db, db), ab = dot(da, db), ra = dot(da, dc), rb = dot(db, dc);
+    return clamp(vec2(ra*bb - rb*ab, rb*aa - ra*ab)/max(aa*bb - ab*ab, 1e-4), 0., 1.);
+  }
+  float risoDots(vec2 p, float ang, float size, float v){
+    float s = sin(ang), c = cos(ang);
+    vec2 q = mat2(c, -s, s, c)*p/size;
+    float d = length(fract(q) - .5) + (hash(floor(p*.8)) - .5)*.07;
+    float r = sqrt(clamp(v, 0., 1.))*.74, aa = 1.3/size;
+    return 1. - smoothstep(r - aa, r + aa, d);
+  }`,
+  body:`
+  int ki = int(P2 + .5);
+  vec3 A = ki == 0 ? vec3(1.,.28,.69) : ki == 1 ? vec3(.95,.31,.38) : ki == 2 ? vec3(1.,.42,.18) : vec3(1.,.91,0.);
+  vec3 B = ki == 0 ? vec3(0.,.47,.75) : ki == 1 ? vec3(0.,.51,.54) : ki == 2 ? vec3(.24,.33,.53) : vec3(.46,.36,.66);
+  vec2 off = vec2(3.2, -2.1)*P1;
+  float lod = 1. + u_lod0;
+  vec3 ca = clamp(sat(texl(uv, lod), 1.15), 0., 1.);
+  vec3 cb = clamp(sat(texl(uv - off/u_res, lod), 1.15), 0., 1.);
+  float mott = .82 + .28*vnoise(p*.05) + .1*vnoise(p*.3);
+  float ia = risoDots(p, .2618, P0, risoSplit(ca, A, B).x*mott);
+  float ib = risoDots(p - off, 1.309, P0, risoSplit(cb, A, B).y*mott);
+  float grain = .9 + .1*vnoise(p*1.7);
+  vec3 paper = vec3(.97,.955,.92)*(.97 + .03*vnoise(p*.6));
+  o = vec4(paper*mix(vec3(1.), A, ia*.92*grain)*mix(vec3(1.), B, ib*.92*grain), 1.);` },
+
+{ id:'sprite', name:'Pixel Sprite', cat:'hybrid', blurb:'Chunky pixels in a 16-color palette with dark sprite outlines, like a character from an indie game.',
+  params:[{label:'Pixel size',min:3,max:16,step:1,val:6,unit:'px'},{label:'Outline',min:0,max:1,step:.01,val:.6},{label:'Palette',options:['Bright 16','Soft 16','Any color'],val:0}],
+  fn: glslArr('SPR', SPRITE) + `
+  vec3 sprNearest(vec3 c, int pal){
+    vec3 best = c; float bd = 1e9;
+    for(int i = 0; i < 16; i++){
+      vec3 q = SPR[pal*16 + i];
+      vec3 d = c - q; float rm = .5*(c.r + q.r);
+      float dist = (2. + rm)*d.r*d.r + 4.*d.g*d.g + (3. - rm)*d.b*d.b;
+      if(dist < bd){ bd = dist; best = q; }
+    }
+    return best;
+  }`,
+  body:`
+  vec2 cell = floor(p/P0);
+  float lod = max(0., log2(P0) - .5) + u_lod0;
+  vec2 px = P0/u_res;
+  vec2 cu = (cell + .5)*px;
+  vec3 c = clamp(sat(texl(cu, lod), 1.3)*1.05, 0., 1.);
+  float n = max(max(luma(texl(cu + vec2(px.x, 0.), lod)), luma(texl(cu - vec2(px.x, 0.), lod))),
+                max(luma(texl(cu + vec2(0., px.y), lod)), luma(texl(cu - vec2(0., px.y), lod))));
+  int pal = int(P2 + .5);
+  vec3 dc = c + (bayer4(cell) - .47)*.09;
+  vec3 col = pal < 2 ? sprNearest(dc, pal) : floor(clamp(dc, 0., 1.)*4.99)/4.;
+  float ol = step(mix(.6, .07, P1), n - luma(c))*step(.001, P1);
+  o = vec4(mix(col, pal == 1 ? SPR[16] : vec3(.05,.04,.08), ol), 1.);` },
+
+/* ---------------- Advanced ---------------- */
+{ id:'painterly', name:'Painterly', cat:'adv', blurb:'Anisotropic Kuwahara filtering. Brush strokes stretch along every edge, so detail survives while flat areas turn into paint.',
+  params:[{label:'Brush size',min:2,max:8,step:.5,val:5},{label:'Sharpness',min:0,max:1,step:.01,val:.55},{label:'Stroke stretch',min:0,max:1,step:.01,val:.6}],
+  passes:[TENSOR_PASS, TBLUR_PASS],
+  fn: FLOW_LIB + KUWA_LIB,
+  body:`
+  vec3 c = kuwahara(uv, P0, mix(4., 14., P1), mix(4., .35, P2));
+  o = vec4(clamp(sat(c, 1.12), 0., 1.), 1.);` },
+
+{ id:'flowink', name:'Flow Ink', cat:'adv', blurb:'Flow-based difference of Gaussians. The lines trace the structure of the image and stay smooth and unbroken, like a confident pen.',
+  params:[{label:'Line weight',min:.6,max:2.4,step:.05,val:1.1,unit:'px'},{label:'Detail',min:0,max:1,step:.01,val:.5},{label:'Style',options:['Ink','Pencil','Neon','Toon'],val:0}],
+  passes:[TENSOR_PASS, TBLUR_PASS, DOGX_PASS],
+  fn: FLOW_LIB,
+  body:`
+  int st = int(P2 + .5);
+  vec4 g = licDoG(uv, 3.);
+  float thr = mix(.05, .01, P1);
+  vec3 c = texl(uv, 1.2 + u_lod0);
+  vec3 paper = vec3(.98,.97,.94)*(.965 + .035*vnoise(p*.7));
+  vec3 col;
+  if(st == 0) col = mix(vec3(.05,.05,.08), paper, inkLine(g, thr, mix(0., .14, P1)));
+  else if(st == 1){
+    float e = inkLine(g, thr*1.15, mix(0., .18, P1));
+    col = mix(vec3(.22,.22,.26), paper, 1. - (1. - e)*(.7 + .3*vnoise(p*1.1)));
+  } else if(st == 2){
+    vec3 nc = mix(clamp(sat(c, 2.2)*1.6, 0., 1.), vec3(1.), .25);
+    float d = inkD(g);
+    col = nc*(smoothstep(thr*.6, thr*1.4, d) + .35*smoothstep(0., thr*3., d));
+  } else {
+    float l = luma(c);
+    vec3 fl = clamp(sat(c*((floor(l*4.) + .6)/4./max(l, .04)), 1.3), 0., 1.);
+    col = fl*inkLine(g, thr, mix(0., .08, P1));
+  }
+  o = vec4(col, 1.);` },
+
+{ id:'lowpoly', name:'Low Poly', cat:'adv', blurb:'The picture rebuilt from flat-shaded triangles on a jittered mesh, with a little 3D lighting on each facet.',
+  params:[{label:'Triangle size',min:12,max:70,step:1,val:30,unit:'px'},{label:'Facet light',min:0,max:1,step:.01,val:.5},{label:'Wireframe',options:['None','Thin','Neon'],val:0}],
+  fn:`
+  vec2 lpV(vec2 id, float S){ return (id + .5 + (hash2(id*1.17 + 3.1) - .5)*.72)*S; }
+  float lpE(vec2 a, vec2 b, vec2 q){ return (b.x - a.x)*(q.y - a.y) - (b.y - a.y)*(q.x - a.x); }`,
+  body:`
+  float S = P0;
+  vec2 base = floor(p/S - .5);
+  vec2 A = vec2(0.), B = vec2(0.), C = vec2(0.);
+  bool found = false;
+  for(int j = -1; j <= 1; j++) for(int i = -1; i <= 1; i++){
+    if(found) break;
+    vec2 id = base + vec2(float(i), float(j));
+    vec2 v00 = lpV(id, S), v10 = lpV(id + vec2(1., 0.), S), v01 = lpV(id + vec2(0., 1.), S), v11 = lpV(id + vec2(1., 1.), S);
+    bool diag = hash(id + 7.7) > .5;
+    for(int k = 0; k < 2; k++){
+      vec2 a, b, c;
+      if(diag){ a = v00; b = k == 0 ? v10 : v11; c = k == 0 ? v11 : v01; }
+      else { a = k == 0 ? v00 : v10; b = k == 0 ? v10 : v11; c = v01; }
+      float e0 = lpE(a, b, p), e1 = lpE(b, c, p), e2 = lpE(c, a, p);
+      if(!found && ((e0 >= 0. && e1 >= 0. && e2 >= 0.) || (e0 <= 0. && e1 <= 0. && e2 <= 0.))){ A = a; B = b; C = c; found = true; }
+    }
+  }
+  if(!found){ o = vec4(texl(uv, 1. + u_lod0), 1.); return; }
+  vec2 ctr = (A + B + C)/3.;
+  float lod = max(0., log2(S*.35)) + u_lod0;
+  vec3 col = (texl(ctr/u_res, lod)*2. + texl(mix(ctr, A, .5)/u_res, lod) + texl(mix(ctr, B, .5)/u_res, lod) + texl(mix(ctr, C, .5)/u_res, lod))/5.;
+  vec3 PA = vec3(A/S, luma(texl(A/u_res, lod + 1.))*2.), PB = vec3(B/S, luma(texl(B/u_res, lod + 1.))*2.), PC = vec3(C/S, luma(texl(C/u_res, lod + 1.))*2.);
+  vec3 n = normalize(cross(PB - PA, PC - PA)); n *= sign(n.z);
+  col *= mix(1., .55 + .6*dot(n, normalize(vec3(-.4, .5, .75))), P1);
+  col = clamp(sat(col, 1.15), 0., 1.);
+  int wi = int(P2 + .5);
+  if(wi > 0){
+    float d = min(min(segd(p, A, B), segd(p, B, C)), segd(p, C, A));
+    if(wi == 1) col = mix(col, col*.45, 1. - smoothstep(.5, 1.3, d));
+    else {
+      vec3 nc = hsv2rgb(vec3(fract(ctr.x/u_res.x*.6 + ctr.y/u_res.y*.3 + u_time*.05), .7, 1.));
+      col = col*.55 + nc*(1. - smoothstep(.6, 1.8, d)) + nc*.25*exp(-d*.35);
+    }
+  }
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'chrome', name:'Liquid Chrome', cat:'adv', blurb:'Brightness becomes depth, and the picture turns into polished liquid metal reflecting a studio.',
+  params:[{label:'Relief',min:.2,max:3,step:.05,val:.9},{label:'Smoothness',min:1,max:5,step:.1,val:3},{label:'Metal',options:['Chrome','Gold','Oil slick'],val:0}],
+  fn:`
+  vec3 chromeEnv(vec3 r){
+    float y = r.y*1.2 + .22;
+    vec3 c = y > 0. ? mix(vec3(.55,.62,.72), vec3(.98,.99,1.), smoothstep(0., .7, y))
+                    : mix(vec3(.32,.29,.27), vec3(.07), smoothstep(0., -.7, y));
+    c += smoothstep(.05, 0., abs(y - .03))*.6;
+    c += smoothstep(.12, .02, abs(r.x + .45))*smoothstep(.1, .5, y)*1.2;
+    c += smoothstep(.08, .01, abs(r.x - .55))*smoothstep(-.2, .3, y)*.8;
+    return c;
+  }
+  float chromeH(vec2 uv, float s){ return luma(texl(uv, s + u_lod0))*.65 + luma(texl(uv, s + 1.5 + u_lod0))*.35; }`,
+  body:`
+  float s = P1;
+  vec2 d = exp2(s)*.75/u_res;
+  float hx = chromeH(uv + vec2(d.x, 0.), s) - chromeH(uv - vec2(d.x, 0.), s);
+  float hy = chromeH(uv + vec2(0., d.y), s) - chromeH(uv - vec2(0., d.y), s);
+  vec3 n = normalize(vec3(-hx*P0*6., -hy*P0*6., 1.));
+  vec3 env = chromeEnv(reflect(vec3(0., 0., -1.), n));
+  int mi = int(P2 + .5);
+  vec3 col;
+  if(mi == 0) col = env*vec3(.92,.95,1.);
+  else if(mi == 1) col = pow(env, vec3(1.25))*vec3(1.,.76,.36)*1.08;
+  else col = env*.55 + hsv2rgb(vec3(fract(n.x*1.3 + n.y*.9 + chromeH(uv, s)*1.5 + u_time*.03), .65, 1.))*.55*(env*.6 + .4);
+  col = mix(col, col*.35, pow(1. - n.z, 2.)*.6);
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'motion', name:'Motion Vision', cat:'adv', blurb:'Real optical flow (Lucas–Kanade): each patch is tracked from one frame to the next and drawn as a motion arrow. It needs movement, so try the demo scene or a video.',
+  params:[{label:'Grid',min:10,max:40,step:1,val:18,unit:'px'},{label:'Sensitivity',min:0,max:1,step:.01,val:.5},{label:'View',options:['Arrows','Color','Both'],val:2}],
+  // pre-pass, one pixel per grid cell: solve the 2x2 Lucas–Kanade system over a 5x5 window
+  passes:[{size:(w, h, f) => [w/uval(f, 0), h/uval(f, 0)], body:`
+  vec2 cc = (floor(gl_FragCoord.xy) + .5)*P0;
+  float sp = max(1., P0/4.);
+  float L = log2(sp) + u_lod0;
+  vec2 dx = vec2(sp/u_res.x, 0.), dy = vec2(0., sp/u_res.y);
+  float sxx = 0., syy = 0., sxy = 0., sxt = 0., syt = 0.;
+  for(int j = -2; j <= 2; j++) for(int i = -2; i <= 2; i++){
+    vec2 q = (cc + vec2(float(i), float(j))*sp)/u_res;
+    float ix = luma(texl(q + dx, L)) - luma(texl(q - dx, L)) + luma(textureLod(u_prev, q + dx, L).rgb) - luma(textureLod(u_prev, q - dx, L).rgb);
+    float iy = luma(texl(q + dy, L)) - luma(texl(q - dy, L)) + luma(textureLod(u_prev, q + dy, L).rgb) - luma(textureLod(u_prev, q - dy, L).rgb);
+    ix *= .25; iy *= .25;
+    float it = luma(texl(q, L)) - luma(textureLod(u_prev, q, L).rgb);
+    float w = exp(-float(i*i + j*j)/5.);
+    sxx += w*ix*ix; syy += w*iy*iy; sxy += w*ix*iy; sxt += w*ix*it; syt += w*iy*it;
+  }
+  float det = sxx*syy - sxy*sxy;
+  float lmin = .5*(sxx + syy - sqrt(max((sxx - syy)*(sxx - syy) + 4.*sxy*sxy, 0.)));
+  vec2 v = vec2(0.);
+  if(lmin > 2e-6 && abs(det) > 1e-12) v = -vec2(syy*sxt - sxy*syt, sxx*syt - sxy*sxt)/det;
+  v = clamp(v, -2.5, 2.5)*sp;
+  o = vec4(v/64. + .5, smoothstep(2e-6, 4e-5, lmin), 1.);`}],
+  body:`
+  vec2 cell = floor(p/P0);
+  vec2 lp = p - (cell + .5)*P0;
+  vec2 v = (texelFetch(u_pass0, ivec2(cell), 0).xy - .5)*64.;
+  vec2 vs = (pass0(uv).xy - .5)*64.;
+  float gain = mix(1., 10., P1);
+  int vi = int(P2 + .5);
+  float gray = luma(texl(uv, .5 + u_lod0));
+  vec3 col = vec3(gray)*.32;
+  if(vi != 0) col += hsv2rgb(vec3(atan(vs.y, vs.x)/(2.*PI) + .5, .85, 1.))*clamp(length(vs)*gain*.06, 0., 1.)*(.25 + .75*gray)*.95;
+  if(vi != 1){
+    vec2 av = v*gain;
+    float al = length(av), mxl = P0*.95;
+    if(al > mxl){ av *= mxl/al; al = mxl; }
+    if(al > 1.5){
+      vec2 dir = av/al, nrm = vec2(-dir.y, dir.x), b = av*.5;
+      float hl = min(al*.45, P0*.3);
+      float d = min(segd(lp, -b, b), min(segd(lp, b, b - dir*hl + nrm*hl*.6), segd(lp, b, b - dir*hl - nrm*hl*.6)));
+      col = mix(col, vi == 2 ? vec3(1.) : hsv2rgb(vec3(atan(v.y, v.x)/(2.*PI) + .5, .55, 1.)), 1. - smoothstep(.6, 1.4, d));
+    } else col = mix(col, vec3(.55), (1. - smoothstep(.6, 1.3, length(lp)))*.6);
+  }
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+/* ---------------- Figure ---------------- */
+{ id:'lifedraw', name:'Life Drawing', cat:'figure', blurb:'A figure study on toned paper: flowing contour lines, smudged shadows and white-chalk highlights, the way artists draw from a model.',
+  params:[{label:'Line weight',min:.6,max:2.2,step:.05,val:1.15,unit:'px'},{label:'Shading',min:0,max:1,step:.01,val:.65},{label:'Medium',options:['Charcoal','Sanguine','Trois crayons'],val:0}],
+  passes:[TENSOR_PASS, TBLUR_PASS, DOGX_PASS],
+  fn: FLOW_LIB,
+  body:`
+  int md = int(P2 + .5);
+  float L = luma(texl(uv, 1. + u_lod0)), Ls = luma(texl(uv, 3.2 + u_lod0)), Lg = luma(texl(uv, 6. + u_lod0));
+  float tone = clamp(.5 + (mix(L, Ls, .55) - Lg)*1.6 + (Lg - .5)*.45, 0., 1.);
+  float tooth = vnoise(p*.85)*.55 + vnoise(p*2.1)*.45;
+  vec2 hd = vec2(.5, .866);
+  float strk = vnoise(vec2(dot(p, hd)*.035, dot(p, vec2(-hd.y, hd.x))*.6));
+  float darkM = smoothstep(tooth - .18, tooth + .12, smoothstep(.6, .1, tone)*P1*(.7 + .6*strk));
+  float midM = smoothstep(tooth - .2, tooth + .15, smoothstep(.72, .38, tone)*P1*(.75 + .5*strk))*(1. - darkM);
+  float chalk = smoothstep(tooth - .25, tooth + .05, smoothstep(.66, .95, tone)*P1*(.8 + .4*strk));
+  float line = (1. - inkLine(licDoG(uv, 3.), .022, .03))*(.75 + .25*tooth);
+  vec3 paper, dk, mid, wh = vec3(.97,.96,.92);
+  if(md == 0){ paper = vec3(.74,.71,.66); dk = vec3(.08,.07,.07); mid = vec3(.36,.34,.33); }
+  else if(md == 1){ paper = vec3(.93,.88,.79); dk = vec3(.5,.18,.11); mid = vec3(.74,.42,.31); }
+  else { paper = vec3(.84,.76,.62); dk = vec3(.1,.08,.08); mid = vec3(.7,.33,.22); }
+  paper *= .94 + .06*fbm(p*vec2(.02, .07));
+  vec3 col = mix(paper, mid, midM*.8);
+  col = mix(col, md == 2 ? mix(dk, mid, .4) : dk, darkM*.85);
+  col = mix(col, wh, chalk*.85);
+  col = mix(col, md == 1 ? dk*.75 : dk, clamp(line, 0., 1.));
+  o = vec4(col, 1.);` },
+
+{ id:'silver', name:'Silver Print', cat:'figure', blurb:'Fine-art black and white: a red-filter mix that flatters skin, a soft highlight glow, film grain and classic darkroom toners.',
+  params:[{label:'Contrast',min:.6,max:2,step:.05,val:1.25},{label:'Glow',min:0,max:1,step:.01,val:.35},{label:'Toner',options:['Neutral','Selenium','Sepia','Platinum','Cyanotype'],val:0}],
+  body:`
+  vec3 wm = vec3(.5,.4,.1);
+  float m = dot(texl(uv, .25 + u_lod0), wm);
+  float bl = mix(dot(texl(uv, 3.5 + u_lod0), wm), dot(texl(uv, 5. + u_lod0), wm), .5);
+  float x = clamp((m - .46)*P0 + .46, 0., 1.);
+  x = mix(x, x*x*(3. - 2.*x), .5);
+  x = 1. - (1. - x)*(1. - smoothstep(.35, 1., bl)*P1*.6);
+  x += (vnoise(p*.75) + vnoise(p*1.6 + 31.) - 1.)*.075*(1. - abs(x - .45)*1.5);
+  vec2 a = uv - .5; x = clamp(x*(1. - .45*dot(a, a)), 0., 1.);
+  int ti = int(P2 + .5);
+  vec3 dk = vec3(0.), md = vec3(.5), lt = vec3(1.);
+  if(ti == 1){ dk = vec3(.05,.03,.06); md = vec3(.47,.45,.48); lt = vec3(.99,.98,.97); }
+  else if(ti == 2){ dk = vec3(.12,.07,.04); md = vec3(.6,.46,.32); lt = vec3(1.,.96,.88); }
+  else if(ti == 3){ dk = vec3(.16,.13,.11); md = vec3(.55,.5,.45); lt = vec3(.97,.94,.89); }
+  else if(ti == 4){ dk = vec3(.02,.1,.28); md = vec3(.25,.5,.72); lt = vec3(.93,.97,.99); }
+  o = vec4(x < .5 ? mix(dk, md, x*2.) : mix(md, lt, x*2. - 1.), 1.);` },
+
+{ id:'chiaro', name:'Chiaroscuro', cat:'figure', blurb:'Old-master lighting. The figure emerges from deep shadow in warm, directional light, like a Caravaggio canvas. Skin keeps its glow.',
+  params:[{label:'Shadow depth',min:0,max:1,step:.01,val:.7},{label:'Warmth',min:0,max:1,step:.01,val:.55},{label:'Light from',options:['Left','Above','Right','Front'],val:0}],
+  fn:`
+  // rough skin likelihood in YCbCr, used to keep bodies lit while the surroundings fall into shadow
+  float skinW(vec3 c){
+    float y = luma(c);
+    float cr = (c.r - y)*.713 + .5, cb = (c.b - y)*.564 + .5;
+    return (1. - smoothstep(.06, .11, abs(cr - .6)))*(1. - smoothstep(.08, .13, abs(cb - .4)))*smoothstep(.06, .2, y);
+  }`,
+  body:`
+  vec3 c = texl(uv, u_lod0), cb = texl(uv, 3.5 + u_lod0);
+  float Lb = luma(cb), Lbb = luma(texl(uv, 5.5 + u_lod0));
+  vec3 cl = c + (c - cb)*.55;
+  int li = int(P2 + .5);
+  vec2 ld = normalize(li == 0 ? vec2(-1., .35) : li == 2 ? vec2(1., .35) : vec2(0., 1.));
+  vec2 a = (uv - .5)*vec2(u_res.x/u_res.y, 1.);
+  float spot = 1. - smoothstep(.04, .72, length(a - (li == 3 ? vec2(0.) : ld*.16)));
+  float ramp = li == 3 ? 1. : clamp(.62 + .85*dot(ld, a), 0., 1.25);
+  float key = smoothstep(.02, .4, mix(Lb, Lbb, .4));
+  float skin = skinW(texl(uv, 3. + u_lod0));
+  float lit = pow(clamp(max(key*spot*ramp, skin*mix(.55, 1., clamp(ramp, 0., 1.))*.95), 0., 1.25), 1.3);
+  vec3 col = cl*pow(mix(1., lit, P0), 1. + P0);
+  float l = luma(col);
+  col = mix(vec3(l), col, .82)*mix(vec3(1.), vec3(1.1,.96,.78), P1);
+  col = mix(vec3(.06,.035,.02)*l*2., col, smoothstep(0., .35, l));
+  col = pow(max(col, 0.), vec3(1. + .25*P0));
+  col += vec3(1.,.72,.38)*pow(Lb, 3.)*.08*P1*lit;
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'statue', name:'Marble Statue', cat:'figure', blurb:'Turns skin into carved stone: smoothed forms, sculpted relief light, and veined marble, bronze, plaster or jade.',
+  params:[{label:'Relief',min:0,max:1,step:.01,val:.6},{label:'Veins',min:0,max:1,step:.01,val:.5},{label:'Material',options:['Marble','Bronze','Plaster','Jade'],val:0}],
+  fn:`
+  float stoneH(vec2 uv){ return luma(texl(uv, 2.6 + u_lod0))*.7 + luma(texl(uv, 4.2 + u_lod0))*.3; }`,
+  body:`
+  float e = sobel(uv, 2., 1. + u_lod0);
+  float Lsm = luma(texl(uv, 2.4 + u_lod0)), Lbig = luma(texl(uv, 5. + u_lod0));
+  float L = mix(Lsm, luma(texl(uv, 1. + u_lod0)), smoothstep(.1, .45, e)*.7);
+  vec2 d = 4./u_res;
+  float hx = stoneH(uv + vec2(d.x, 0.)) - stoneH(uv - vec2(d.x, 0.));
+  float hy = stoneH(uv + vec2(0., d.y)) - stoneH(uv - vec2(0., d.y));
+  vec3 n = normalize(vec3(-hx*7., -hy*7., 1.));
+  vec3 ldir = normalize(vec3(-.45, .55, .7));
+  float lam = max(dot(n, ldir), 0.);
+  float spec = pow(max(dot(reflect(-ldir, n), vec3(0., 0., 1.)), 0.), 24.);
+  float ao = smoothstep(-.18, .05, Lsm - Lbig);
+  float s = mix(L, L*(.45 + .8*lam), P0)*mix(1., .55 + .45*ao, P0*.8);
+  s = clamp((s - .5)*1.3 + .56, 0., 1.);
+  vec2 q = p/u_res.y*2.2;
+  float warp = fbm(q*1.3 + fbm(q*2.1)*1.6);
+  float ph = q.x*.8 + q.y*.45 + warp*4.;
+  float veins = clamp(pow(1. - abs(sin(ph*PI)), 10.)*.85 + pow(1. - abs(sin((ph*2.7 + warp*3.)*PI)), 28.)*.5, 0., 1.)*(.6 + .4*fbm(q*5.));
+  int mi = int(P2 + .5);
+  vec3 col;
+  if(mi == 0){
+    col = mix(vec3(.42,.44,.48), vec3(.95,.94,.9), s) + vec3(1.,.95,.88)*smoothstep(.5, .9, s)*.06;
+    col = mix(col, col*vec3(.64,.67,.71), veins*P1);
+    col += spec*.1*P0;
+  } else if(mi == 1){
+    col = mix(vec3(.1,.06,.03), vec3(.82,.56,.3), pow(s, 1.3));
+    col = mix(col, vec3(.22,.44,.36), smoothstep(.5, .15, s)*(.6 + .4*fbm(q*6.))*P1*.8);
+    col += vec3(1.,.85,.6)*spec*.55*P0;
+  } else if(mi == 2){
+    col = mix(vec3(.55,.53,.5), vec3(.97,.96,.93), smoothstep(0., 1., s))*(.97 + .03*vnoise(p*1.3));
+    col = mix(col, col*.88, veins*P1*.2);
+  } else {
+    col = mix(vec3(.03,.2,.12), vec3(.55,.85,.6), s) + vec3(.2,.5,.3)*smoothstep(.4, 1., s)*.25;
+    col = mix(col, col*vec3(.75,.9,.8), veins*P1*.7) + spec*.3*P0;
+  }
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'rimlight', name:'Rim Light', cat:'figure', blurb:'Bodies fall into silhouette and every contour catches colored rim light, like a studio shoot lit with two gels.',
+  params:[{label:'Glow',min:0,max:1.5,step:.01,val:.8},{label:'Body',min:0,max:1,step:.01,val:.3},{label:'Lights',options:['Two gels','Warm','Cool','Spectrum'],val:0}],
+  body:`
+  float lod = .8 + u_lod0;
+  vec2 dd = 1.6/u_res;
+  float tl = luma(texl(uv+vec2(-dd.x, dd.y), lod)), tc = luma(texl(uv+vec2(0., dd.y), lod)), tr = luma(texl(uv+dd, lod));
+  float ml = luma(texl(uv-vec2(dd.x,0.), lod)), mr = luma(texl(uv+vec2(dd.x,0.), lod));
+  float bl = luma(texl(uv-dd, lod)), bc = luma(texl(uv-vec2(0.,dd.y), lod)), br = luma(texl(uv+vec2(dd.x,-dd.y), lod));
+  float gx = (tr + 2.*mr + br) - (tl + 2.*ml + bl);
+  float gy = (tl + 2.*tc + tr) - (bl + 2.*bc + br);
+  float e2 = sobel(uv, 4., 2.4 + u_lod0), e3 = sobel(uv, 9., 3.8 + u_lod0);
+  float L = luma(texl(uv, lod)), Lb = luma(texl(uv, 3. + u_lod0));
+  float rim = smoothstep(.12, .55, length(vec2(gx, gy)))*(.35 + .65*smoothstep(-.03, .08, L - Lb));
+  int li = int(P2 + .5);
+  vec3 rc;
+  if(li == 0) rc = mix(vec3(.15,.75,1.), vec3(1.,.25,.6), clamp(.5 - .5*gx/(abs(gx) + abs(gy) + 1e-4), 0., 1.));
+  else if(li == 1) rc = vec3(1.,.62,.3);
+  else if(li == 2) rc = vec3(.45,.75,1.);
+  else rc = hsv2rgb(vec3(atan(gy, gx)/(2.*PI) + .5, .75, 1.));
+  vec3 body = texl(uv, 1. + u_lod0);
+  body = mix(vec3(luma(body)), body, .6)*pow(L, 1.6)*P1;
+  vec3 col = body + rc*(rim*1.3 + (e2*.8 + e3*.7)*P0);
+  o = vec4(1. - exp(-col*1.25), 1.);` },
+
+{ id:'engrave', name:'Engraving', cat:'figure', blurb:'Banknote-style line engraving. Parallel lines swell in the shadows and bend around the form, with cross-hatching in the deepest darks.',
+  params:[{label:'Line spacing',min:3,max:10,step:.25,val:5,unit:'px'},{label:'Contour bend',min:0,max:1,step:.01,val:.55},{label:'Ink',options:['Black','Banknote','Sepia','Indigo'],val:0}],
+  fn:`
+  float eline(float d, float w, float S){ return clamp((w - d)*S + .5, 0., 1.)*clamp(w*S*2., 0., 1.); }`,
+  body:`
+  float S = P0;
+  float L = luma(texl(uv, .8 + u_lod0));
+  float Ls = luma(texl(uv, 3.6 + u_lod0)), Lss = luma(texl(uv, 5. + u_lod0));
+  float dark = 1. - clamp((mix(L, Ls, .25) - .5)*1.2 + .5, 0., 1.);
+  float disp = ((Ls - .5)*.7 + (Lss - .5)*.5)*P1*S*7.;
+  float ph = (p.y + disp + sin(p.x*.011 + Lss*3.)*S*.8*P1)/S;
+  float ink = eline(abs(fract(ph) - .5), dark*.55, S);
+  ink = max(ink, eline(abs(fract((dot(p, vec2(.8, .6)) + disp*.6)/(S*1.1)) - .5), clamp((dark - .5)*.85, 0., .45), S*1.1));
+  ink = max(ink, eline(abs(fract((dot(p, vec2(-.6, .8)) - disp*.5)/(S*1.25)) - .5), clamp((dark - .72)*1.1, 0., .4), S*1.25));
+  ink = max(ink, smoothstep(.28, .6, sobel(uv, 1.1, .7 + u_lod0))*.9);
+  int ii = int(P2 + .5);
+  vec3 paper = (ii == 1 ? vec3(.92,.95,.88) : ii == 2 ? vec3(.96,.92,.84) : vec3(.97,.96,.93))*(.97 + .03*vnoise(p*.9));
+  vec3 ic = ii == 0 ? vec3(.06,.06,.08) : ii == 1 ? vec3(.1,.27,.18) : ii == 2 ? vec3(.3,.17,.08) : vec3(.1,.13,.35);
+  o = vec4(mix(paper, ic, ink), 1.);` },
 ];
 const byId = Object.fromEntries(FILTERS.map(f => [f.id, f]));
-const CATS = [{id:'all',name:'All'},{id:'cartoon',name:'Cartoon'},{id:'art',name:'Fine Art'},{id:'retro',name:'Retro'},{id:'lab',name:'Lab'}];
-const CAT_NAME = {basic:'No filter', cartoon:'Cartoon', art:'Fine Art', retro:'Retro', lab:'Lab'};
-const STAGE_CAT = {basic:'#d6d3df', cartoon:'#ffc83d', art:'#ff7396', retro:'#45d0c1', lab:'#a98bff'};
+const CATS = [{id:'all',name:'All'},{id:'cartoon',name:'Cartoon'},{id:'art',name:'Fine Art'},{id:'retro',name:'Retro'},{id:'lab',name:'Lab'},{id:'hybrid',name:'Hybrid'},{id:'adv',name:'Advanced'},{id:'figure',name:'Figure'}];
+const CAT_NAME = {basic:'No filter', cartoon:'Cartoon', art:'Fine Art', retro:'Retro', lab:'Lab', hybrid:'Hybrid', adv:'Advanced', figure:'Figure'};
+const STAGE_CAT = {basic:'#d6d3df', cartoon:'#ffc83d', art:'#ff7396', retro:'#45d0c1', lab:'#a98bff', hybrid:'#a3e05c', adv:'#6aa8ff', figure:'#ff8d62'};
 
 // saved settings
 const savedVals = store.get('vals', {});
+// a saved value is only used if it still fits the control (filters can change between versions)
+const fits = (pd, v) => typeof v === 'number' && isFinite(v) &&
+  (pd.options ? Number.isInteger(v) && v >= 0 && v < pd.options.length : v >= pd.min && v <= pd.max);
 FILTERS.forEach(f => {
   f.values = f.params.map((pd, i) => {
     const s = savedVals[f.id] && savedVals[f.id][i];
-    return (typeof s === 'number') ? s : pd.val;
+    return fits(pd, s) ? s : pd.val;
   });
 });
 // value passed to the shader (options with a map, e.g. Pop Art grid 0..3 -> 1..4)
@@ -890,17 +1530,31 @@ void main(){
 gl.useProgram(blitProg.p); gl.uniform1i(blitProg.u('u_out'), 0); gl.uniform1i(blitProg.u('u_orig'), 1);
 gl.useProgram(prepProg.p); gl.uniform1i(prepProg.u('u_src'), 0);
 
+// Filters compile the first time they're needed (a visible thumbnail or a selection), which keeps start-up quick.
+// A filter can also have pre-passes that render into scratch targets before its main pass reads them.
+const SAMPLERS = ['u_tex','u_prev','u_fb','u_glyph','u_hist','u_pass0','u_pass1','u_pass2'];
+const wrapMain = (lib, body) => HEADER + (lib || '') + `\nvoid main(){\n vec2 uv = v_uv;\n vec2 p = uv*u_res;\n${body}\n}`;
+function filterProgram(src){
+  const P = program(src);
+  gl.useProgram(P.p);
+  SAMPLERS.forEach((n, i) => gl.uniform1i(P.u(n), i));
+  return P;
+}
 const broken = [];
-FILTERS.forEach(f => {
+function ensure(f){
+  if(!f) return false;
+  if(f.prog !== undefined) return !!f.prog;
   try {
-    f.prog = program(HEADER + (f.fn || '') + `\nvoid main(){\n vec2 uv = v_uv;\n vec2 p = uv*u_res;\n${f.body}\n}`);
-    gl.useProgram(f.prog.p);
-    ['u_tex','u_prev','u_fb','u_glyph','u_hist'].forEach((n, i) => gl.uniform1i(f.prog.u(n), i));
+    (f.passes || []).forEach(ps => { if(!ps.prog) ps.prog = filterProgram(wrapMain(ps.fn, ps.body)); });
+    f.prog = filterProgram(wrapMain(f.fn, f.body));
   } catch(e){
     console.error(`Filter "${f.name}" failed to compile:\n`, e.message);
-    broken.push(f.name);
+    f.prog = null; broken.push(f.name);
+    if(f.card) f.card.hidden = true;
+    if(typeof toast === 'function') toast(`The ${f.name} filter couldn’t load on this graphics card.`, 5000);
   }
-});
+  return !!f.prog;
+}
 
 function newTex(w, h, mip){
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
@@ -936,18 +1590,30 @@ gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
 gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
 gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-// ASCII glyph atlas
+// Glyph atlas: the luminance ramp, then four edge strokes (| — / \) drawn edge to edge so
+// neighbouring cells join into lines, then the "code" characters used by Matrix Code.
 const glyphTex = plainTex();
 function makeGlyphs(){
   const gw = 40, gh = 64, n = GLYPHS.length;
-  const c = document.createElement('canvas'); c.width = gw*n; c.height = gh;
+  const c = document.createElement('canvas'); c.width = gw*ATLAS_N; c.height = gh;
   const x = c.getContext('2d');
   x.fillStyle = '#000'; x.fillRect(0, 0, c.width, c.height);
   x.fillStyle = '#fff'; x.font = '700 46px "JetBrains Mono", ui-monospace, Consolas, monospace';
   x.textAlign = 'center'; x.textBaseline = 'middle';
   for(let i = 0; i < n; i++) x.fillText(GLYPHS[i], i*gw + gw/2, gh/2 + 2);
+  x.strokeStyle = '#fff'; x.lineWidth = 6; x.lineCap = 'butt';
+  [[gw/2, 0, gw/2, gh], [0, gh/2, gw, gh/2], [0, gh, gw, 0], [0, 0, gw, gh]].forEach(([x0, y0, x1, y1], k) => {
+    const ox = (n + k)*gw;
+    x.save(); x.beginPath(); x.rect(ox, 0, gw, gh); x.clip();
+    x.beginPath(); x.moveTo(ox + x0, y0); x.lineTo(ox + x1, y1); x.stroke();
+    x.restore();
+  });
+  x.font = '700 44px "JetBrains Mono", ui-monospace, Consolas, monospace';
+  for(let i = 0; i < CODE.length; i++) x.fillText(CODE[i], (n + 4 + i)*gw + gw/2, gh/2 + 2);
   gl.bindTexture(gl.TEXTURE_2D, glyphTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
 }
 makeGlyphs();
 if(document.fonts) document.fonts.ready.then(makeGlyphs);
@@ -982,8 +1648,31 @@ function alloc(w, h){
   thumbImg = new ImageData(new Uint8ClampedArray(thumbBuf.buffer), TW, TH);
   FILTERS.forEach(f => { if(f.cv){ f.cv.width = TW; f.cv.height = TH; } });
   document.documentElement.style.setProperty('--ar', `${w}/${h}`);
+  allocScratch(w, h);
   if(hist) allocHist();
   fitFrame();
+}
+// Scratch targets for filter pre-passes. Half-float where the browser can render to it, 8-bit otherwise
+// (every pass writes values in 0..1 so either works).
+let scratch = [], SW = 1, SH = 1;
+let scrFmt = gl.getExtension('EXT_color_buffer_float') ? gl.RGBA16F : gl.RGBA8;
+function allocScratch(w, h){
+  scratch.forEach(s => { gl.deleteTexture(s.tex); gl.deleteFramebuffer(s.fbo); });
+  scratch = [];
+  for(let k = 0; k < 3; k++){
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, scrFmt, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = newFbo(t);
+    scratch.push({tex:t, fbo});
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && scrFmt !== gl.RGBA8){
+      scrFmt = gl.RGBA8; return allocScratch(w, h);
+    }
+  }
+  SW = w; SH = h;
 }
 function allocHist(){
   if(hist){ gl.deleteTexture(hist.tex); gl.deleteFramebuffer(hist.fbo); }
@@ -999,20 +1688,42 @@ function allocHist(){
 }
 function bindTex(unit, target, t){ gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(target, t); }
 
-function runFilter(f, w, h, fbTex){
-  const P = f.prog; gl.useProgram(P.p);
+const passSize = [[1, 1], [1, 1], [1, 1]];
+function setupProgram(P, f, w, h, fbTex, tw, th, nPass){
+  gl.useProgram(P.p);
   bindTex(0, gl.TEXTURE_2D, prepT[cur]);
   bindTex(1, gl.TEXTURE_2D, prepT[cur^1]);
   bindTex(2, gl.TEXTURE_2D, fbTex);
   bindTex(3, gl.TEXTURE_2D, glyphTex);
   bindTex(4, gl.TEXTURE_2D_ARRAY, hist ? hist.tex : dummyArr);
+  for(let k = 0; k < 3; k++){
+    const ok = k < nPass, s = ok ? passSize[k] : [1, 1];
+    bindTex(5 + k, gl.TEXTURE_2D, ok ? scratch[k].tex : blackTex);
+    gl.uniform4f(P.u('u_ps' + k), s[0], s[1], ok ? s[0]/SW : 1, ok ? s[1]/SH : 1);
+  }
   gl.uniform2f(P.u('u_res'), w, h);
+  gl.uniform2f(P.u('u_outRes'), tw, th);
+  gl.uniform1f(P.u('u_lod0'), Math.max(0, Math.log2(W/w)));
   gl.uniform1f(P.u('u_time'), (performance.now()/1000) % 3600);
   for(let i = 0; i < 3; i++) gl.uniform1f(P.u('P' + i), uval(f, i));
   gl.uniform1f(P.u('u_histHead'), hist ? hist.head : 0);
   gl.uniform1f(P.u('u_histN'), hist ? hist.n : 1);
   gl.uniform1f(P.u('u_histFill'), hist ? hist.fill : 0);
   gl.uniform1f(P.u('u_glyphN'), GLYPHS.length);
+}
+// Runs a filter's pre-passes (if any) into the scratch targets, then its main pass into fbo.
+function runFilter(f, w, h, fbTex, fbo){
+  const ps = f.passes || [];
+  ps.forEach((pass, k) => {
+    const s = pass.size ? pass.size(w, h, f) : [w, h];
+    const pw = Math.max(1, Math.min(SW, Math.ceil(s[0]))), ph = Math.max(1, Math.min(SH, Math.ceil(s[1])));
+    passSize[k] = [pw, ph];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, scratch[k].fbo); gl.viewport(0, 0, pw, ph);
+    setupProgram(pass.prog, f, w, h, fbTex, pw, ph, k);
+    draw();
+  });
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.viewport(0, 0, w, h);
+  setupProgram(f.prog, f, w, h, fbTex, w, h, ps.length);
   draw();
 }
 function blitTo(t, bg, sp, w, h){
@@ -1207,7 +1918,7 @@ function loadFile(file){
 
 /* ================= UI: tabs, grid, params ================= */
 let active = byId[store.get('filter', 'cel')] || byId.cel;
-if(!active.prog) active = byId.original;
+if(!ensure(active)){ active = byId.original; ensure(active); }
 let tab = store.get('tab', 'all');
 if(!CATS.some(c => c.id === tab)) tab = 'all';
 
@@ -1224,7 +1935,6 @@ const io = new IntersectionObserver(entries => {
   entries.forEach(en => { const f = byId[en.target.dataset.id]; if(f) f.visible = en.isIntersecting; });
 }, {root: gridEl, threshold: 0});
 FILTERS.forEach(f => {
-  if(!f.prog) return;
   const b = document.createElement('button');
   b.className = 'card'; b.dataset.id = f.id; b.setAttribute('role', 'option');
   b.style.setProperty('--c', `var(--${f.cat})`);
@@ -1238,7 +1948,7 @@ FILTERS.forEach(f => {
 });
 function renderTabs(){
   tabsEl.querySelectorAll('.tab').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === tab));
-  FILTERS.forEach(f => { if(f.card) f.card.hidden = !(tab === 'all' || f.cat === tab); });
+  FILTERS.forEach(f => { if(f.card) f.card.hidden = f.prog === null || !(tab === 'all' || f.cat === tab); });
   gridEl.scrollTop = 0; gridEl.scrollLeft = 0;
 }
 
@@ -1297,7 +2007,7 @@ function renderParams(){
 }
 function setFilter(id, scroll = true){
   const f = byId[id];
-  if(!f || !f.prog) return;
+  if(!ensure(f)) return;
   active = f; store.set('filter', id);
   if(f.hist && !hist && W) allocHist();
   if(f.fb) clearOut();
@@ -1316,7 +2026,7 @@ function step(dir){
   if(next) setFilter(next.id);
 }
 function surprise(){
-  const pool = FILTERS.filter(f => f.prog && f.id !== 'original' && f !== active);
+  const pool = FILTERS.filter(f => f.prog !== null && f.id !== 'original' && f !== active);
   const f = pool[Math.floor(Math.random()*pool.length)];
   f.values = f.params.map(pd => {
     if(pd.options) return Math.floor(Math.random()*pd.options.length);
@@ -1464,12 +2174,12 @@ window.addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; $('#dr
 /* ================= main loop ================= */
 let frameNo = 0, thumbI = 0, fpsT = performance.now(), fpsN = 0;
 function thumbStep(){
-  const list = FILTERS.filter(f => f.prog && f.visible && f.card && !f.card.hidden);
+  const list = FILTERS.filter(f => f.prog !== null && f.visible && f.card && !f.card.hidden);
   if(!list.length) return;
   thumbI = (thumbI + 1) % list.length;
   const f = list[thumbI];
-  gl.bindFramebuffer(gl.FRAMEBUFFER, thumbFA); gl.viewport(0, 0, TW, TH);
-  runFilter(f, TW, TH, blackTex);
+  if(!ensure(f)) return;
+  runFilter(f, TW, TH, blackTex, thumbFA);
   gl.bindFramebuffer(gl.FRAMEBUFFER, thumbFB);
   blitTo(thumbTA, bgOf(f), -1, TW, TH);
   gl.readPixels(0, 0, TW, TH, gl.RGBA, gl.UNSIGNED_BYTE, thumbBuf);
@@ -1510,8 +2220,7 @@ function frame(now){
   }
   // 3. run the filter (ping-pong so feedback filters can read last frame)
   oc ^= 1;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, outF[oc]); gl.viewport(0, 0, W, H);
-  runFilter(active, W, H, outT[oc^1]);
+  runFilter(active, W, H, outT[oc^1], outF[oc]);
   // 4. composite to screen
   gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H);
   blitTo(outT[oc], bgOf(active), split, W, H);
@@ -1536,15 +2245,16 @@ if(navigator.permissions && navigator.permissions.query){
 }
 // Console helper: __fb.bench('oil') returns milliseconds per full-size render of a filter.
 function bench(id, n = 20){
-  const f = byId[id]; if(!f || !W) return null;
+  const f = byId[id]; if(!f || !W || !ensure(f)) return null;
   const px = new Uint8Array(4);
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
   const t0 = performance.now();
-  for(let i = 0; i < n; i++){ gl.bindFramebuffer(gl.FRAMEBUFFER, outF[oc]); gl.viewport(0, 0, W, H); runFilter(f, W, H, outT[oc^1]); }
+  for(let i = 0; i < n; i++) runFilter(f, W, H, outT[oc^1], outF[oc]);
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
   return +((performance.now() - t0)/n).toFixed(2);
 }
-window.__fb = {FILTERS, setFilter, broken, bench};
+// __fb.compileAll() compiles every filter up front and returns the names of any that failed.
+window.__fb = {FILTERS, setFilter, broken, bench, compileAll: () => (FILTERS.forEach(ensure), broken)};
 })();
 </script>
 </body>
