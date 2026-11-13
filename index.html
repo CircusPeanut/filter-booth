@@ -171,7 +171,12 @@ kbd{font:500 10.5px var(--f-mono);border:1px solid var(--line);border-bottom-wid
   .invite span{display:none}
   .invite{right:50%;bottom:50%;transform:translate(50%,50%);padding:6px}
 }
+.countdown{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none;background:radial-gradient(circle,rgba(0,0,0,.28),transparent 62%)}
+.countdown span{font:800 clamp(72px,22vmin,180px)/1 var(--f-display);color:#fff;text-shadow:0 6px 40px rgba(0,0,0,.55);animation:tick 1s ease-out both}
+@keyframes tick{0%{transform:scale(1.4);opacity:0}18%{transform:scale(1);opacity:1}100%{transform:scale(.92);opacity:.9}}
+.tsec{font-variant-numeric:tabular-nums}
 @media (prefers-reduced-motion: reduce){
+  .countdown span{animation:none}
   .flash.go,.shot,.rec.on .dot{animation:none}
   .toast{transition:none}
 }
@@ -204,6 +209,7 @@ kbd{font:500 10.5px var(--f-mono);border:1px solid var(--line);border-bottom-wid
         <div class="hud br" id="hudRec" hidden>● REC 0:00</div>
         <div class="split" id="split" hidden><span class="lab l">Original</span><span class="lab r" id="splitLab">Filter</span><span class="knob">↔</span></div>
         <div class="flash" id="flash"></div>
+        <div class="countdown" id="countdown" hidden><span id="countNum"></span></div>
       </div>
       <div class="invite" id="invite"><span>This is a demo scene.</span><button id="inviteCam">Turn on camera</button></div>
       <div class="drop" id="drop" hidden>Drop a photo or video</div>
@@ -215,6 +221,7 @@ kbd{font:500 10.5px var(--f-mono);border:1px solid var(--line);border-bottom-wid
         <button class="tool" id="btnCompare" aria-pressed="false" title="Before / after (C)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/></svg>Compare</button>
       </div>
       <div class="capture">
+        <button class="tool" id="btnTimer" aria-pressed="false" title="Self-timer (T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9.5 2h5M12 2v3"/></svg><span id="timerLabel" class="tsec">Timer</span></button>
         <button class="shutter" id="btnShutter" aria-label="Take photo (Space)" title="Take photo (Space)"></button>
         <button class="rec" id="btnRec" title="Record a clip (R)"><span class="dot"></span><span id="recLabel">Record</span></button>
       </div>
@@ -270,6 +277,15 @@ const SPRITE = [
   '#ff004d','#ffa300','#ffec27','#00e436','#29adff','#83769c','#ff77a8','#ffccaa',
   '#1a1c2c','#5d275d','#b13e53','#ef7d57','#ffcd75','#a7f070','#38b764','#257179',
   '#29366f','#3b5dc9','#41a6f6','#73eff7','#f4f4f4','#94b0c2','#566c86','#333c57'];
+const BRICKS = ['#f2f3f2','#a0a5a9','#646464','#1b2a34','#c91a09','#720e0f','#fe8a18','#f2cd37','#bbe90b','#237841','#184632','#0055bf',
+  '#5a93db','#0a3463','#e4cd9e','#958a73','#582a12','#f6d7b3','#d09168','#aa7d55','#fc97ac','#81007b','#36aebf','#6074a1'];
+// rough skin likelihood in YCbCr
+const SKIN_LIB = `
+float skinW(vec3 c){
+  float y = luma(c);
+  float cr = (c.r - y)*.713 + .5, cb = (c.b - y)*.564 + .5;
+  return (1. - smoothstep(.06, .11, abs(cr - .6)))*(1. - smoothstep(.08, .13, abs(cb - .4)))*smoothstep(.06, .2, y);
+}`;
 
 /* ================= shader library ================= */
 const HEADER = `#version 300 es
@@ -1458,6 +1474,490 @@ const FILTERS = [
   vec3 paper = (ii == 1 ? vec3(.92,.95,.88) : ii == 2 ? vec3(.96,.92,.84) : vec3(.97,.96,.93))*(.97 + .03*vnoise(p*.9));
   vec3 ic = ii == 0 ? vec3(.06,.06,.08) : ii == 1 ? vec3(.1,.27,.18) : ii == 2 ? vec3(.3,.17,.08) : vec3(.1,.13,.35);
   o = vec4(mix(paper, ic, ink), 1.);` },
+
+/* ---------------- batch 3 ---------------- */
+{ id:'timesplit', name:'Time Split', cat:'lab', blurb:'Red, green and blue are each captured at a different moment, so anything that moves splits into colored ghosts.',
+  hist:true,
+  params:[{label:'Delay',min:2,max:30,step:1,val:8,unit:'frames'},{label:'Channels',options:['RGB','BGR','3D glasses'],val:0}],
+  body:`
+  vec3 now = texl(uv, 1. + u_lod0);
+  float maxD = u_histFill - 1.;
+  if(maxD < 2.){ o = vec4(now, 1.); return; }
+  float d1 = min(P0, floor(maxD*.5)), d2 = min(P0*2., maxD);
+  vec3 c1 = texture(u_hist, vec3(uv, mod(u_histHead - d1 + u_histN, u_histN))).rgb;
+  vec3 c2 = texture(u_hist, vec3(uv, mod(u_histHead - d2 + u_histN, u_histN))).rgb;
+  int m = int(P1 + .5);
+  o = vec4(m == 0 ? vec3(now.r, c1.g, c2.b) : m == 1 ? vec3(c2.r, c1.g, now.b) : vec3(now.r, c2.g, c2.b), 1.);` },
+
+{ id:'planet', name:'Tiny Planet', cat:'lab', blurb:'Wraps the picture around itself into a little planet, or flips it inside out into a tunnel.',
+  params:[{label:'Zoom',min:.3,max:3,step:.01,val:1.1},{label:'Spin',min:0,max:1,step:.01,val:.15},{label:'Mode',options:['Planet','Tunnel'],val:0}],
+  body:`
+  vec2 a = (uv - .5)*vec2(u_res.x/u_res.y, 1.);
+  float r = length(a);
+  float ang = atan(a.y, a.x) + u_time*P1*.4;
+  float sx = 1. - abs(fract(ang/(2.*PI) + .25)*2. - 1.);
+  float sy = pow(clamp(r*P0*1.35, 0., 1.), 1.15);
+  if(P2 > .5) sy = 1. - sy;
+  float lod = max(0., log2(u_res.x/u_res.y/(PI*max(r, .004)))) + u_lod0;
+  o = vec4(texl(vec2(sx, clamp(sy, .002, .998)), lod), 1.);` },
+
+{ id:'crt', name:'CRT Screen', cat:'retro', blurb:'An old tube monitor: curved glass, glowing phosphor stripes, scanlines and a little ghosting.',
+  fb:true,
+  params:[{label:'Curvature',min:0,max:1,step:.01,val:.5},{label:'Scanlines',min:120,max:480,step:10,val:240},{label:'Phosphor',options:['Color','Green','Amber'],val:0}],
+  body:`
+  vec2 c = uv*2. - 1.;
+  c *= 1. + P0*.12*dot(c, c);
+  vec2 q = c*.5 + .5;
+  vec2 e = abs(c);
+  float inside = (e.x > 1. || e.y > 1.) ? 0. : 1. - smoothstep(.055, .065, length(max(e - .935, 0.)));
+  float y = q.y*P1;
+  float lod = max(0., log2(u_res.y/P1) - .3) + u_lod0;
+  vec3 s = texl(vec2(q.x, (floor(y) + .5)/P1), lod);
+  vec3 glow = texl(q, 3.2 + u_lod0);
+  int ph = int(P2 + .5);
+  vec3 tint = ph == 1 ? vec3(.3,1.,.45) : vec3(1.,.66,.18);
+  if(ph > 0){ s = vec3(luma(s))*tint; glow = vec3(luma(glow))*tint; }
+  float beam = exp(-pow((fract(y) - .5)/mix(.2, .42, luma(s)), 2.));
+  float mx = mod(floor(p.x), 3.);
+  vec3 mask = ph > 0 ? vec3(.88 + .12*step(mx, .5)) : vec3(mx < .5 ? 1. : .3, (mx > .5 && mx < 1.5) ? 1. : .3, mx > 1.5 ? 1. : .3)*1.55;
+  vec3 col = s*beam*1.35*mask + glow*.22;
+  col *= (.96 + .04*sin(u_time*55.))*(1. - .18*dot(c, c));
+  col = max(col, texture(u_fb, uv).rgb*.5);
+  col = mix(vec3(.015), col, inside);
+  col += .05*smoothstep(.6, 0., length(c - vec2(-.5, .55)))*inside;
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'instant', name:'Instant Film', cat:'retro', blurb:'A faded instant photo in its white frame, with soft colors, a vignette and the odd light leak.',
+  params:[{label:'Fade',min:0,max:1,step:.01,val:.5},{label:'Light leak',min:0,max:1,step:.01,val:.35},{label:'Film',options:['Classic','Cool','Warm','B&W'],val:0}],
+  body:`
+  vec2 R = u_res;
+  vec2 lo = vec2(.045, .17)*R.y, hi = vec2(R.x - .045*R.y, R.y*.955);
+  vec3 paper = vec3(.95,.945,.92)*(.975 + .025*vnoise(p*.5));
+  vec2 out2 = max(lo - p, p - hi);
+  if(max(out2.x, out2.y) > 0.){ o = vec4(paper*(1. - .1*exp(-max(out2.x, out2.y)*.35)), 1.); return; }
+  vec2 sz = hi - lo;
+  float k = max(sz.x/R.x, sz.y/R.y);
+  vec3 c = texl(((p - (lo + hi)*.5)/k + R*.5)/R, .6 + u_lod0);
+  vec2 a = (p - (lo + hi)*.5)/sz;
+  int fm = int(P2 + .5);
+  float l = luma(c);
+  c = mix(c, vec3(l), .15 + .2*P0);
+  c = c*(1. - .28*P0) + .14*P0;
+  if(fm == 0){ c *= vec3(1.03,1.,.92); c += vec3(-.02,.01,.05)*(1. - l); }
+  else if(fm == 1){ c *= vec3(.92,1.,1.06); c += vec3(0.,.02,.05); }
+  else if(fm == 2){ c *= vec3(1.1,1.,.82); c += vec3(.03,.01,-.02); }
+  else c = vec3(luma(c))*vec3(1.,.98,.95);
+  c *= 1. - .5*pow(length(a*1.15), 2.2);
+  float leak = smoothstep(.9, -.2, length(a - vec2(.62, .35)))*P1;
+  c = 1. - (1. - c)*(1. - (fm == 3 ? vec3(.8) : vec3(1.,.45,.15))*leak*.8);
+  c += (vnoise(p*.9) - .5)*.05;
+  vec2 ed = min(p - lo, hi - p);
+  c = mix(c*.6, c, smoothstep(0., 4., min(ed.x, ed.y)));
+  o = vec4(clamp(c, 0., 1.), 1.);` },
+
+{ id:'bricks', name:'Brick Build', cat:'hybrid', blurb:'The picture rebuilt from toy bricks, one stud per square, in toy-brick colors.',
+  params:[{label:'Brick size',min:8,max:32,step:1,val:14,unit:'px'},{label:'Colors',options:['Brick palette','Any color'],val:0},{label:'Style',options:['Studs','Flat tiles','Round plates'],val:0}],
+  fn: glslArr('BRK', BRICKS) + `
+  vec3 brkNearest(vec3 c){
+    vec3 best = c; float bd = 1e9;
+    for(int i = 0; i < ${BRICKS.length}; i++){
+      vec3 d = c - BRK[i]; float rm = .5*(c.r + BRK[i].r);
+      float dist = (2. + rm)*d.r*d.r + 4.*d.g*d.g + (3. - rm)*d.b*d.b;
+      if(dist < bd){ bd = dist; best = BRK[i]; }
+    }
+    return best;
+  }`,
+  body:`
+  float S = P0;
+  vec2 cell = floor(p/S);
+  vec2 lu = fract(p/S) - .5;
+  float lod = max(0., log2(S) - .7) + u_lod0;
+  vec3 c = clamp(sat(texl((cell + .5)*S/u_res, lod), 1.15), 0., 1.);
+  vec3 b = P1 < .5 ? brkNearest(c) : floor(c*5.99)/5.;
+  int st = int(P2 + .5);
+  float aa = 1.5/S;
+  vec2 ed = .5 - abs(lu);
+  float bev = smoothstep(0., .06, min(ed.x, ed.y));
+  vec3 col = b*(.78 + .22*bev);
+  col *= 1. + .12*smoothstep(.06, 0., ed.y)*step(0., lu.y) + .08*smoothstep(.06, 0., ed.x)*step(lu.x, 0.)
+            - .14*smoothstep(.06, 0., ed.y)*step(lu.y, 0.) - .1*smoothstep(.06, 0., ed.x)*step(0., lu.x);
+  if(st == 0){
+    float r = .3, d = length(lu);
+    col *= 1. - .3*smoothstep(r + .07, r - .01, length(lu - vec2(.04, -.05)))*smoothstep(r - .02, r + .02, d);
+    vec3 sc = b*(1.02 + .28*dot(normalize(lu + 1e-4), vec2(-.7, .7))*smoothstep(r - .1, r, d));
+    sc += .22*smoothstep(.13, 0., length(lu - vec2(-.1, .1)));
+    col = mix(col, sc, smoothstep(r + aa, r - aa, d));
+  } else if(st == 2){
+    float d = length(lu);
+    vec3 pc = b*(.9 + .2*dot(normalize(lu + 1e-4), vec2(-.7, .7))*smoothstep(.3, .48, d)) + .18*smoothstep(.15, 0., length(lu - vec2(-.15, .15)));
+    col = mix(vec3(.12)*(.8 + .2*bev), pc, smoothstep(.48 + aa, .48 - aa, d));
+  } else col += .1*smoothstep(.25, 0., length(lu - vec2(-.2, .2)))*bev;
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'stitch', name:'Cross-Stitch', cat:'hybrid', blurb:'Embroidered in little X stitches on woven cloth, like a sampler, with pale areas left as bare fabric.',
+  params:[{label:'Stitch size',min:5,max:16,step:1,val:8,unit:'px'},{label:'Thread colors',min:3,max:7,step:1,val:5},{label:'Cloth',options:['White','Linen','Black'],val:0}],
+  body:`
+  float S = P0;
+  vec2 cell = floor(p/S);
+  vec2 lu = fract(p/S);
+  vec3 c = clamp(sat(texl((cell + .5)*S/u_res, max(0., log2(S) - .5) + u_lod0), 1.25), 0., 1.);
+  float n = P1 - 1.;
+  vec3 th = floor(c*n + .5)/n;
+  int cl = int(P2 + .5);
+  vec3 cloth = cl == 0 ? vec3(.95,.94,.9) : cl == 1 ? vec3(.86,.8,.68) : vec3(.07,.07,.08);
+  vec2 wv = fract(p/(S/4.));
+  vec2 qc = vec2(min(lu.x, 1. - lu.x), min(lu.y, 1. - lu.y));
+  vec3 col = cloth*(.93 + .07*sin(wv.x*PI*2.)*sin(wv.y*PI*2.))*(1. - .35*smoothstep(.14, .06, length(qc)));
+  float on = step(.2, length(th - cloth));
+  float w = .17, aa = 1.2/S;
+  float dA = abs(lu.x + lu.y - 1.)*.7071, dB = abs(lu.x - lu.y)*.7071;
+  float sA = smoothstep(w + aa, w - aa, dA)*on, sB = smoothstep(w + aa, w - aa, dB)*on;
+  vec3 cA = th*(.55 + .5*sqrt(max(1. - pow(dA/w, 2.), 0.)))*(.88 + .12*sin((lu.x - lu.y)*S*1.6));
+  vec3 cB = th*(.6 + .5*sqrt(max(1. - pow(dB/w, 2.), 0.)))*(.88 + .12*sin((lu.x + lu.y)*S*1.6));
+  col = mix(col, cA, sA);
+  col = mix(col, col*.68, clamp(smoothstep(w + .07, w, dB)*on - sB, 0., 1.));
+  col = mix(col, cB, sB);
+  o = vec4(col, 1.);` },
+
+{ id:'stencil', name:'Stencil Graffiti', cat:'hybrid', blurb:'A three-layer spray-paint stencil on a wall, with soft overspray and the odd drip.',
+  params:[{label:'Threshold',min:.2,max:.8,step:.01,val:.45},{label:'Accent',options:['Red','Teal','Yellow','Pink'],val:0},{label:'Wall',options:['Brick','Concrete','Poster'],val:0}],
+  fn:`
+  float stTone(vec2 uv, float lod){ return clamp((luma(texl(uv, lod)) - .5)*1.4 + .5, 0., 1.); }`,
+  body:`
+  float lod = 1.2 + u_lod0;
+  float L = stTone(uv, lod);
+  float spk = (hash(p) - .5)*.08 + (vnoise(p*.35) - .5)*.06;
+  float t1 = P0 - .12, t2 = P0 + .12;
+  float dark = smoothstep(t1 + .03, t1 - .03, L + spk);
+  float mid = smoothstep(t2 + .03, t2 - .03, L + spk)*(1. - dark);
+  float dcol = floor(p.x/4.);
+  float dl = step(.88, hash(vec2(dcol, 7.)))*mix(12., 70., hash(vec2(dcol, 3.)));
+  float drip = 0.;
+  if(dl > 0. && abs(fract(p.x/4.) - .5)*4. < .9){
+    for(int i = 1; i <= 5; i++){
+      float y = dl*float(i)/5.;
+      drip = max(drip, smoothstep(t1 + .03, t1 - .03, stTone(uv + vec2(0., y)/u_res, lod))*(1. - float(i)/6.));
+    }
+  }
+  float haze = smoothstep(t1 + .2, t1 - .05, stTone(uv, 3. + u_lod0))*(1. - dark);
+  int wl = int(P2 + .5);
+  vec3 wall; float wt;
+  if(wl == 0){
+    vec2 bs = vec2(64., 26.);
+    vec2 bp = p/bs; bp.x += step(1., mod(floor(bp.y), 2.))*.5;
+    vec2 bi = floor(bp), bf = fract(bp);
+    float mortar = 1. - smoothstep(1.5, 3., min(min(bf.x, 1. - bf.x)*bs.x, min(bf.y, 1. - bf.y)*bs.y));
+    wt = .88 + .12*vnoise(p*.3);
+    wall = mix(vec3(.6,.3,.22)*(.85 + .3*hash(bi)), vec3(.72,.7,.66), mortar)*wt;
+  } else if(wl == 1){ wt = .85 + .15*fbm(p*.02) + (hash(p*.5) - .5)*.06; wall = vec3(.62,.62,.6)*wt; }
+  else { wt = .96 + .04*vnoise(p*.7); wall = vec3(.93,.91,.86)*wt; }
+  int ai = int(P1 + .5);
+  vec3 acc = ai == 0 ? vec3(.85,.12,.12) : ai == 1 ? vec3(.05,.6,.6) : ai == 2 ? vec3(.98,.78,.1) : vec3(1.,.35,.65);
+  vec3 col = wall*(1. - .22*haze);
+  col = mix(col, acc*(.9 + .1*wt), mid*.95);
+  col = mix(col, vec3(.05)*(.9 + .1*wt), max(dark, drip)*.97);
+  o = vec4(col, 1.);` },
+
+{ id:'shatter', name:'Shattered', cat:'hybrid', blurb:'The picture cracks like a struck pane of glass. Shards shift and catch the light around the point of impact.',
+  params:[{label:'Cracks',min:6,max:22,step:1,val:13},{label:'Shift',min:0,max:1,step:.01,val:.5},{label:'Type',options:['Glass','Mirror'],val:0}],
+  body:`
+  vec2 asp = vec2(u_res.x/u_res.y, 1.);
+  vec2 imp = vec2(.47, .55);
+  vec2 d = (uv - imp)*asp;
+  float r = length(d), N = P0;
+  float th = atan(d.y, d.x);
+  float a = th/(2.*PI) + .5;
+  float aj = a + (vnoise(vec2(r*38., a*N*3.1)) - .5)*.16/N + (hash(vec2(floor(a*N), 1.)) - .5)*.3/N;
+  float k = floor(aj*N), fa = fract(aj*N);
+  float dRad = min(fa, 1. - fa)/N*2.*PI*r*u_res.y;
+  float rr = r*cos(th - ((k + .5)/N - .5)*2.*PI);
+  float g = 1.6;
+  float lr = log(max(rr, .001)/.03)/log(g) + hash(vec2(k, 2.))*.6;
+  float j = floor(lr), fr = fract(lr);
+  float lo = step(.3, hash(vec2(k, j))), hi = step(.3, hash(vec2(k, j + 1.)));
+  float dRing = min(lo > .5 ? fr : 9., hi > .5 ? 1. - fr : 9.)*rr*log(g)*u_res.y;
+  float dmin = min(dRad, dRing);
+  vec2 sid = vec2(k, j);
+  float rot = (hash(sid + 9.1) - .5)*.07*P1;
+  vec2 rd = vec2(cos(rot)*d.x - sin(rot)*d.y, sin(rot)*d.x + cos(rot)*d.y);
+  vec2 suv = rd/asp + imp + (hash2(sid + 3.7) - .5)*.022*P1*(.5 + .12*max(j, 0.));
+  int ty = int(P2 + .5);
+  vec3 col = texl(clamp(suv, 0., 1.), .2 + u_lod0)*(.9 + .2*hash(sid + 1.3));
+  col += .07*dot(normalize(d + 1e-4), normalize(hash2(sid + 5.5) - .5))*(ty == 0 ? 1. : .5);
+  float crack = 1. - smoothstep(.4, 1.4, dmin);
+  float glint = smoothstep(5., 0., dmin)*(1. - crack);
+  if(ty == 0) col = mix(col + glint*.22, vec3(.97), crack*.85);
+  else col = mix(col*vec3(.93,.97,1.04) - glint*.15, vec3(.04), crack*.9);
+  col = mix(col, ty == 0 ? vec3(.93) : vec3(.6), smoothstep(.028, .006, r)*(.55 + .45*hash(floor(p/2.))));
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'swirl', name:'Impasto Swirl', cat:'adv', blurb:'Thick swirling brush strokes that follow the shapes in the picture, in the spirit of Van Gogh, with raised paint that catches the light.',
+  params:[{label:'Stroke length',min:4,max:16,step:1,val:11},{label:'Stroke width',min:1,max:5,step:.1,val:2.4,unit:'px'},{label:'Relief',min:0,max:1,step:.01,val:.6}],
+  passes:[TENSOR_PASS, TBLUR_PASS],
+  fn: FLOW_LIB + `
+  vec2 swirlDir(vec2 x, vec2 tp){
+    vec4 f = flowAt(x/u_res);
+    float an = fbm(x*.0035)*12.57;
+    vec2 sw = vec2(cos(an), sin(an));
+    sw = dot(sw, tp) < 0. ? -sw : sw;
+    vec2 t = dot(f.xy, tp) < 0. ? -f.xy : f.xy;
+    return normalize(mix(sw, t, smoothstep(.12, .45, f.z)) + 1e-5);
+  }`,
+  body:`
+  float sw = P1;
+  int L = int(P0);
+  vec2 t0 = swirlDir(p, flowAt(uv).xy);
+  vec3 cacc = texl(uv, 1. + u_lod0);
+  float nacc = vnoise(p/sw*.7), ws = 1.;
+  for(int s = 0; s < 2; s++){
+    vec2 x = p, tp = s == 0 ? t0 : -t0;
+    for(int i = 1; i <= 16; i++){
+      if(i > L) break;
+      vec2 tt = swirlDir(x, tp);
+      x += tt*1.5;
+      tp = tt;
+      float w = 1. - float(i)/(float(L) + 1.);
+      cacc += texl(x/u_res, 1. + u_lod0)*w;
+      nacc += vnoise(x/sw*.7)*w;
+      ws += w;
+    }
+  }
+  vec3 col = cacc/ws;
+  float h = nacc/ws;
+  vec3 n = normalize(vec3(-dFdx(h)*P2*30., -dFdy(h)*P2*30., 1.));
+  col = sat(col, 1.35);
+  col = floor(col*8.)/8.*.35 + col*.65;
+  col *= (.7 + .45*dot(n, normalize(vec3(-.4, .5, .75))))*(.92 + .2*(h - .5)*P2);
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'rain', name:'Rainy Window', cat:'adv', blurb:'Looking out through a fogged, rain-streaked window. Every droplet is a tiny lens that flips the scene behind it.',
+  params:[{label:'Rain',min:0,max:1,step:.01,val:.6},{label:'Fog',min:0,max:1,step:.01,val:.55},{label:'Drip speed',min:0,max:1,step:.01,val:.4}],
+  fn:`
+  // one layer of droplets on a jittered grid: xy = offset from the drop centre (cell units), z = coverage, w = glint
+  vec4 rainDrops(vec2 g, float dens, float seed){
+    vec2 id = floor(g), f = fract(g) - .5;
+    vec4 res = vec4(0.);
+    for(int j = -1; j <= 1; j++) for(int i = -1; i <= 1; i++){
+      vec2 o2 = vec2(float(i), float(j));
+      vec2 cid = id + o2;
+      vec2 h = hash2(cid + seed);
+      if(h.x > dens) continue;
+      vec2 c = o2 + (hash2(cid*1.7 + seed) - .5)*.8;
+      float rad = mix(.1, .3, h.y);
+      vec2 dv = (f - c)/rad;
+      dv.y *= 1.15;
+      float dd = dot(dv, dv);
+      float m = smoothstep(1., .72, dd);
+      if(m > res.z) res = vec4(dv*rad, m, smoothstep(.35, .0, length(dv - vec2(-.35, .4))));
+    }
+    return res;
+  }`,
+  body:`
+  vec2 asp = vec2(u_res.x/u_res.y, 1.);
+  vec2 q = uv*asp;
+  float cols = 9.;
+  float x = q.x*cols;
+  float cid = floor(x);
+  float spd = mix(.12, .4, hash(vec2(cid, 1.)))*(.15 + P2*1.6);
+  float tt = u_time*spd + hash(vec2(cid, 2.));
+  float yd = 1.15 - fract(tt)*1.35;
+  float on = step(hash(vec2(cid, floor(tt))), P0*.9);
+  float cx = cid + .5 + (hash(vec2(cid, 3.)) - .5)*.5 + sin(q.y*12. + cid*7.)*.12 + sin(q.y*31. + cid)*.04;
+  float dx = (x - cx)/cols, dy = q.y - yd;
+  vec2 dr = vec2(dx/.02, dy/.028);
+  float runM = smoothstep(1., .7, dot(dr, dr))*on;
+  float trail = smoothstep(.011, .004, abs(dx))*step(0., dy)*smoothstep(.5, 0., dy)*on;
+  vec4 s1 = rainDrops(q*14., .25 + .5*P0, 1.);
+  vec4 s2 = rainDrops(q*32. + vec2(0., trail*3.), .15 + .6*P0, 7.);
+  vec2 off = vec2(0.); float m = 0., gl = 0.;
+  if(s2.z > 0.){ off = s2.xy/32.; m = s2.z; gl = s2.w; }
+  if(s1.z > m){ off = s1.xy/14.; m = s1.z; gl = s1.w; }
+  if(runM > m){ off = dr*vec2(.02, .028); m = runM; gl = smoothstep(.4, 0., length(dr - vec2(-.35, .4))); }
+  vec3 fogc = texl(uv, mix(1.5, 4.4, P1) + u_lod0);
+  fogc = mix(fogc, vec3(luma(fogc)), .25)*(1. - .15*P1) + .13*P1;
+  vec3 col = mix(fogc, texl(uv, .3 + u_lod0), trail*.85);
+  vec3 lens = texl(clamp(uv - off*3.2/asp, 0., 1.), .5 + u_lod0);
+  col = mix(col, lens*(.7 + .3*m), m);
+  col += gl*m*.5;
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'tiltshift', name:'Tilt-Shift', cat:'adv', blurb:'Fakes a miniature: a narrow band stays sharp, everything above and below melts into lens blur, and colors turn toy-bright.',
+  params:[{label:'Blur',min:0,max:1,step:.01,val:.65},{label:'Focus height',min:.15,max:.85,step:.01,val:.45},{label:'Focus band',min:.02,max:.3,step:.01,val:.1}],
+  body:`
+  float rad = max(0., abs(uv.y - P1) - P2)*P0*u_res.y*.12;
+  vec3 col;
+  if(rad < .6) col = texl(uv, u_lod0);
+  else {
+    vec3 acc = vec3(0.); float ws = 0.;
+    float lod = max(0., log2(rad/3.)) + u_lod0;
+    for(int i = 0; i < 16; i++){
+      float fi = float(i), an = fi*2.39996;
+      vec3 c = texl(uv + vec2(cos(an), sin(an))*sqrt((fi + .5)/16.)*rad/u_res, lod);
+      float w = 1. + 3.*pow(luma(c), 4.);
+      acc += c*w; ws += w;
+    }
+    col = acc/ws;
+  }
+  col = clamp((sat(col, 1.4) - .5)*1.12 + .52, 0., 1.);
+  vec2 a = uv - .5;
+  o = vec4(col*(1. - .3*dot(a, a)), 1.);` },
+
+{ id:'pixelsort', name:'Pixel Sort', cat:'adv', blurb:'Glitch-art pixel sorting: runs of bright pixels are sorted by brightness into long streaks.',
+  params:[{label:'Threshold',min:.1,max:.9,step:.01,val:.45},{label:'Max streak',min:40,max:400,step:5,val:200,unit:'px'},{label:'Direction',options:['Down','Right','Up','Left'],val:0}],
+  body:`
+  int di = int(P2 + .5);
+  vec2 dir = di == 0 ? vec2(0., -1.) : di == 1 ? vec2(1., 0.) : di == 2 ? vec2(0., 1.) : vec2(-1., 0.);
+  float lod = .6 + u_lod0;
+  vec3 c0 = texl(uv, lod);
+  float l0 = luma(c0);
+  if(l0 < P0){ o = vec4(c0, 1.); return; }
+  float st = P1/40.;
+  vec3 cmin = c0, cmax = c0; float lmin = l0, lmax = l0, back = 0., fwd = 0.;
+  for(int s = 0; s < 2; s++){
+    float sg = s == 0 ? -1. : 1.;
+    for(int i = 1; i <= 40; i++){
+      vec2 q = uv + dir*sg*float(i)*st/u_res;
+      if(q.x < 0. || q.x > 1. || q.y < 0. || q.y > 1.) break;
+      vec3 c = texl(q, lod); float l = luma(c);
+      if(l < P0) break;
+      if(s == 0) back = float(i)*st; else fwd = float(i)*st;
+      if(l < lmin){ lmin = l; cmin = c; }
+      if(l > lmax){ lmax = l; cmax = c; }
+    }
+  }
+  o = vec4(mix(cmin, cmax, back/max(back + fwd, 1.)) + (hash(p) - .5)/255., 1.);` },
+
+{ id:'tintype', name:'Tintype', cat:'figure', blurb:'A Victorian wet-plate portrait: blue-sensitive silver on dark metal, soft and swirling at the edges, with flow marks and wear.',
+  params:[{label:'Edge blur',min:0,max:1,step:.01,val:.55},{label:'Plate wear',min:0,max:1,step:.01,val:.5},{label:'Plate',options:['Tintype','Ambrotype','Daguerreotype'],val:0}],
+  body:`
+  vec2 asp = vec2(u_res.x/u_res.y, 1.);
+  vec2 a = (uv - .5)*asp;
+  float r = length(a);
+  float bl = smoothstep(.18, .75, r)*P0;
+  vec2 tng = vec2(-a.y, a.x)/max(r, 1e-3)/asp;
+  vec3 c = vec3(0.);
+  for(int i = -2; i <= 2; i++) c += texl(uv + tng*float(i)*bl*.012, u_lod0 + bl*1.8);
+  c /= 5.;
+  float m = clamp((dot(c, vec3(.08,.32,.6)) - .4)*1.5 + .5, 0., 1.);
+  m = pow(m, 1.25);
+  int pt = int(P2 + .5);
+  vec3 dk = pt == 0 ? vec3(.06,.05,.045) : pt == 1 ? vec3(.09,.06,.04) : vec3(.12,.13,.15);
+  vec3 lt = pt == 0 ? vec3(.84,.8,.7) : pt == 1 ? vec3(.92,.85,.7) : vec3(.92,.94,.97);
+  vec3 col = mix(dk, lt, m);
+  if(pt == 2) col += vec3(.02,.04,.07)*(1. - m);
+  float fl = fbm(vec2(uv.x*3., uv.y*8.) + vec2(0., uv.x*2.));
+  col *= 1. - smoothstep(.42, .95, r + (fl - .5)*.3*P1)*.85;
+  col = mix(col, dk*.6, smoothstep(.55, .9, fbm(vec2(uv.x*40., uv.y*2.5)))*smoothstep(.3, 0., uv.y)*P1*.6);
+  for(int k = 0; k < 6; k++){
+    float fk = float(k);
+    float an = hash(vec2(fk, 9.1))*PI;
+    vec2 dv = vec2(cos(an), sin(an));
+    vec2 rel = (uv - hash2(vec2(fk, 5.3)))*asp;
+    float sc = smoothstep(.0016, 0., abs(dot(rel, vec2(-dv.y, dv.x))))*step(abs(dot(rel, dv)), .08 + .25*hash(vec2(fk, 1.7)));
+    col = mix(col, lt*1.05, sc*P1*.6);
+  }
+  col = mix(col, dk, step(.997, hash(floor(p/2.)))*P1*.8);
+  col *= mix(.25, 1., smoothstep(.1, .085, length(max(abs(uv - .5)*2. - .9, 0.))));
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'dblexp', name:'Double Exposure', cat:'figure', blurb:'A second scene printed inside the figure: a misty forest, a nebula or a city at night, the classic poster look.',
+  params:[{label:'Blend',min:0,max:1,step:.01,val:.75},{label:'Key',min:0,max:1,step:.01,val:.5},{label:'Scene',options:['Misty forest','Nebula','Night city'],val:0}],
+  fn:`
+  vec3 deForest(vec2 q){
+    vec3 col = mix(vec3(.96,.95,.92), vec3(.84,.88,.9), smoothstep(.2, 1., q.y));
+    for(int L = 0; L < 3; L++){
+      float fl = 2. - float(L);
+      float x = q.x*(7. + fl*5.) + fl*3.7;
+      float id = floor(x);
+      float f = fract(x) - .5 - (hash(vec2(id, fl + 4.)) - .5)*.35;
+      float h = (.45 + .4*hash(vec2(id, fl)))*(1. - fl*.15);
+      float y = (q.y - (-.25 + fl*.12))/h;
+      float wdt = (1. - y)*.34*(.5 + .5*(1. - fract(y*8.))) + .012;
+      float tree = step(abs(f), wdt)*step(0., y)*step(y, 1.)*step(hash(vec2(id, fl + 9.)), .85);
+      col = mix(col, mix(vec3(.06,.08,.07), vec3(.62,.67,.68), fl*.38), tree);
+      col = mix(col, vec3(.95,.95,.94), (.1 + .45*smoothstep(.35, -.1, q.y))*(fl > 0. ? 1. : .6));
+    }
+    return col;
+  }
+  vec3 deNebula(vec2 q){
+    vec2 w = q*2.5;
+    float n1 = fbm(w + fbm(w*1.3)*1.5), n2 = fbm(w*1.7 + 4.);
+    vec3 col = vec3(.02,.01,.05) + vec3(.6,.15,.65)*pow(n1, 2.2)*1.7 + vec3(.1,.55,.75)*pow(n2, 2.5)*1.5;
+    vec2 sg = floor(q*u_res.y*.5);
+    return col + step(.996, hash(sg))*hash(sg + 1.);
+  }
+  vec3 deCity(vec2 q){
+    vec3 col = mix(vec3(.3,.12,.14), vec3(.02,.02,.07), smoothstep(0., .8, q.y));
+    for(int L = 0; L < 3; L++){
+      float fl = 2. - float(L);
+      float sc = 6. + fl*5.;
+      float x = q.x*sc + fl*1.3;
+      float id = floor(x), f = fract(x);
+      float inB = step(q.y, (.25 + .5*pow(hash(vec2(id, fl + 1.)), 2.))*(1. - fl*.18))*step(.06, f)*step(f, .94);
+      vec2 wg = vec2(f*8., q.y*sc*6.);
+      vec2 wi = floor(wg), wf = fract(wg);
+      float lit = step(.55, hash(wi + id*13. + fl*7.))*step(.25, wf.x)*step(wf.x, .75)*step(.3, wf.y)*step(wf.y, .7);
+      col = mix(col, mix(vec3(.03,.03,.05) + fl*.03, mix(vec3(1.,.8,.45), vec3(.6,.8,1.), hash(wi + 3.))*(1. - fl*.25), lit), inB);
+    }
+    return col;
+  }`,
+  body:`
+  vec2 q = uv*vec2(u_res.x/u_res.y, 1.);
+  int sc = int(P2 + .5);
+  float L = luma(texl(uv, .5 + u_lod0));
+  float hk = clamp((L - .5)*(sc == 0 ? 1.6 : 1.5) + .5 + (P1 - .5)*.8, 0., 1.);
+  vec3 col;
+  if(sc == 0) col = mix(vec3(hk), 1. - (1. - vec3(hk))*(1. - deForest(q)), P0);
+  else {
+    vec3 scene = sc == 1 ? deNebula(q) : deCity(q);
+    col = mix(vec3(hk), hk*(scene*1.3 + .15) + hk*hk*.2, P0);
+  }
+  o = vec4(clamp(col, 0., 1.), 1.);` },
+
+{ id:'softfocus', name:'Soft Focus', cat:'figure', blurb:'Old-Hollywood glamour: smoothed skin, glowing highlights with a warm halation, and gently lifted shadows.',
+  params:[{label:'Glow',min:0,max:1,step:.01,val:.55},{label:'Skin smoothing',min:0,max:1,step:.01,val:.6},{label:'Tone',options:['Warm','Neutral','Pastel','Noir'],val:0}],
+  fn: SKIN_LIB,
+  body:`
+  vec3 c = texl(uv, u_lod0);
+  vec3 b1 = texl(uv, 1.6 + u_lod0), b2 = texl(uv, 3.2 + u_lod0), b3 = texl(uv, 4.8 + u_lod0);
+  float sm = skinW(b2)*(1. - smoothstep(.15, .5, sobel(uv, 1.5, .8 + u_lod0)))*P1;
+  vec3 col = mix(c, mix(b1, c, .25), sm);
+  col = mix(col, b1, .15*P0);
+  vec3 glow = max(b2*.6 + b3*.4 - .45, 0.)*1.8*P0;
+  col = 1. - (1. - col)*(1. - glow*mix(vec3(1.), vec3(1.,.55,.4), .4));
+  col = col*.92 + .06;
+  int tn = int(P2 + .5);
+  if(tn == 0) col *= vec3(1.06,1.,.9);
+  else if(tn == 2) col = mix(col, vec3(luma(col)), .3)*vec3(1.03,.98,1.04) + vec3(.04,.02,.05);
+  else if(tn == 3) col = vec3(luma(col))*vec3(1.,.99,.97);
+  vec2 a = uv - .5;
+  o = vec4(clamp(col*(1. - .35*dot(a, a)), 0., 1.), 1.);` },
+
+{ id:'stipple', name:'Stipple', cat:'figure', blurb:'A pen-and-ink stipple drawing built from thousands of dots, packed tight in the shadows and sparse in the light.',
+  params:[{label:'Dot size',min:1.5,max:6,step:.1,val:2.6,unit:'px'},{label:'Contrast',min:.6,max:2,step:.05,val:1.2},{label:'Ink',options:['Black','Sepia','Indigo'],val:0}],
+  body:`
+  float S = P0*1.6;
+  float lod = max(0., log2(S) - .5) + u_lod0;
+  float ink = 0.;
+  for(int L = 0; L < 2; L++){
+    float s = L == 0 ? S : S*.62;
+    vec2 off = L == 0 ? vec2(0.) : vec2(.37, .71)*s;
+    vec2 id = floor((p + off)/s);
+    for(int j = -1; j <= 1; j++) for(int i = -1; i <= 1; i++){
+      vec2 cid = id + vec2(float(i), float(j));
+      vec2 ctr = (cid + .5 + (hash2(cid + float(L)*17.) - .5)*.8)*s - off;
+      float dk = pow(clamp((.5 - luma(texl(ctr/u_res, lod)))*P1 + .5, 0., 1.), 1.5);
+      if(L == 1) dk = smoothstep(.55, 1., dk);
+      if(dk*1.08 > hash(cid*1.31 + float(L)*5.)){
+        float rad = P0*.5*(.85 + .3*hash(cid + 2.));
+        ink = max(ink, smoothstep(rad + .6, rad - .6, length(p - ctr)));
+      }
+    }
+  }
+  int ii = int(P2 + .5);
+  vec3 paper = vec3(.97,.955,.92)*(.97 + .03*vnoise(p*.8));
+  vec3 ic = ii == 0 ? vec3(.05,.05,.06) : ii == 1 ? vec3(.3,.18,.09) : vec3(.08,.1,.3);
+  o = vec4(mix(paper, ic, ink), 1.);` },
 ];
 const byId = Object.fromEntries(FILTERS.map(f => [f.id, f]));
 const CATS = [{id:'all',name:'All'},{id:'cartoon',name:'Cartoon'},{id:'art',name:'Fine Art'},{id:'retro',name:'Retro'},{id:'lab',name:'Lab'},{id:'hybrid',name:'Hybrid'},{id:'adv',name:'Advanced'},{id:'figure',name:'Figure'}];
@@ -1478,6 +1978,10 @@ FILTERS.forEach(f => {
 // value passed to the shader (options with a map, e.g. Pop Art grid 0..3 -> 1..4)
 const uval = (f, i) => { const pd = f.params[i]; if(!pd) return 0; const v = f.values[i]; return pd.map ? pd.map(v) : v; };
 const saveVals = () => store.set('vals', Object.fromEntries(FILTERS.map(f => [f.id, f.values])));
+// Strength: how much of the filter is mixed over the original picture (1 = all filter)
+const savedMix = store.get('mix', {});
+FILTERS.forEach(f => { const m = savedMix[f.id]; f.mix = (typeof m === 'number' && m >= 0 && m <= 1) ? m : 1; });
+const saveMix = () => store.set('mix', Object.fromEntries(FILTERS.filter(f => f.mix !== 1).map(f => [f.id, f.mix])));
 
 /* ================= WebGL setup ================= */
 const canvas = $('#view');
@@ -1518,10 +2022,11 @@ uniform sampler2D u_src; uniform float u_mirror;
 void main(){ vec2 s = v_uv; if(u_mirror > .5) s.x = 1.-s.x; o = vec4(texture(u_src, s).rgb, 1.); }`);
 const blitProg = program(`#version 300 es
 precision highp float; in vec2 v_uv; out vec4 o;
-uniform sampler2D u_out, u_orig; uniform float u_bg, u_split; uniform vec2 u_res;
+uniform sampler2D u_out, u_orig; uniform float u_bg, u_split, u_mix; uniform vec2 u_res;
 void main(){
   vec3 c = texture(u_out, v_uv).rgb;
   if(u_bg > 0.){ vec3 b = texture(u_orig, v_uv).rgb*u_bg; c = 1.-(1.-c)*(1.-b); }
+  c = mix(texture(u_orig, v_uv).rgb, c, u_mix);
   if(u_split >= 0.){
     if(v_uv.x < u_split) c = texture(u_orig, v_uv).rgb;
   }
@@ -1726,8 +2231,9 @@ function runFilter(f, w, h, fbTex, fbo){
   setupProgram(f.prog, f, w, h, fbTex, w, h, ps.length);
   draw();
 }
-function blitTo(t, bg, sp, w, h){
+function blitTo(t, bg, sp, w, h, mx = 1){
   gl.useProgram(blitProg.p);
+  gl.uniform1f(blitProg.u('u_mix'), mx);
   bindTex(0, gl.TEXTURE_2D, t);
   bindTex(1, gl.TEXTURE_2D, prepT[cur]);
   gl.uniform1f(blitProg.u('u_bg'), bg);
@@ -1996,11 +2502,24 @@ function renderParams(){
     }
     box.appendChild(row);
   });
+  if(f.id !== 'original'){
+    const row = document.createElement('div'); row.className = 'prow';
+    const lbl = document.createElement('label'); lbl.className = 'lbl'; lbl.htmlFor = 'param-mix';
+    const t = document.createElement('span'); t.textContent = 'Strength';
+    const out = document.createElement('output'); out.textContent = Math.round(f.mix*100) + '%';
+    lbl.append(t, out);
+    const r = document.createElement('input'); r.type = 'range'; r.id = 'param-mix';
+    r.min = 0; r.max = 1; r.step = .01; r.value = f.mix;
+    r.addEventListener('input', () => { f.mix = +r.value; out.textContent = Math.round(f.mix*100) + '%'; });
+    r.addEventListener('change', saveMix);
+    row.append(lbl, r);
+    box.appendChild(row);
+  }
   const foot = document.createElement('div'); foot.className = 'pfoot';
-  foot.innerHTML = `<span class="keys"><kbd>←</kbd> <kbd>→</kbd> switch · <kbd>Space</kbd> photo</span>`;
+  foot.innerHTML = `<span class="keys"><kbd>←</kbd> <kbd>→</kbd> switch · <kbd>Space</kbd> photo · <kbd>T</kbd> timer</span>`;
   if(f.params.length){
     const rb = document.createElement('button'); rb.textContent = 'Reset';
-    rb.addEventListener('click', () => { f.values = f.params.map(pd => pd.val); saveVals(); if(f.fb) clearOut(); renderParams(); });
+    rb.addEventListener('click', () => { f.values = f.params.map(pd => pd.val); f.mix = 1; saveVals(); saveMix(); if(f.fb) clearOut(); renderParams(); });
     foot.appendChild(rb);
   }
   box.appendChild(foot);
@@ -2136,6 +2655,44 @@ function toggleRec(){
 }
 const fmtTime = s => { s = Math.floor(s); return `${Math.floor(s/60)}:${String(s%60).padStart(2, '0')}`; };
 
+/* ================= self-timer ================= */
+// The first press sets 5 s; further presses cycle 10 s, 3 s and off. With a timer set, the shutter,
+// Space and Record count down on the stage first; pressing again during the countdown cancels it.
+const TIMER_STEPS = [0, 5, 10, 3];
+let timerSecs = store.get('timer', 0);
+if(!TIMER_STEPS.includes(timerSecs)) timerSecs = 0;
+let countdown = null;
+function syncTimer(){
+  $('#btnTimer').setAttribute('aria-pressed', timerSecs > 0);
+  $('#timerLabel').textContent = timerSecs ? timerSecs + ' s' : 'Timer';
+}
+function cycleTimer(){
+  cancelCountdown();
+  timerSecs = TIMER_STEPS[(TIMER_STEPS.indexOf(timerSecs) + 1) % TIMER_STEPS.length];
+  store.set('timer', timerSecs); syncTimer();
+  toast(timerSecs ? `Self-timer on: captures start ${timerSecs} seconds after you press.` : 'Self-timer off.', 2600);
+}
+function cancelCountdown(){
+  if(!countdown) return;
+  clearInterval(countdown); countdown = null;
+  $('#countdown').hidden = true;
+}
+function withTimer(action){
+  if(countdown){ cancelCountdown(); return; }
+  if(!timerSecs){ action(); return; }
+  const num = $('#countNum');
+  let left = timerSecs;
+  const show = () => { num.textContent = left; num.style.animation = 'none'; void num.offsetWidth; num.style.animation = ''; };
+  $('#countdown').hidden = false; show();
+  countdown = setInterval(() => {
+    left--;
+    if(left > 0) show();
+    else { cancelCountdown(); action(); }
+  }, 1000);
+}
+const recPress = () => recorder ? toggleRec() : withTimer(toggleRec);
+syncTimer();
+
 /* ================= wiring ================= */
 $('#btnCam').addEventListener('click', () => startCamera(store.get('cam', null)));
 $('#inviteCam').addEventListener('click', () => startCamera(store.get('cam', null)));
@@ -2145,8 +2702,9 @@ $('#btnFile').addEventListener('click', () => $('#fileIn').click());
 $('#fileIn').addEventListener('change', e => { loadFile(e.target.files[0]); e.target.value = ''; });
 $('#btnMirror').addEventListener('click', () => { mirror = !mirror; syncSourceUI(); });
 $('#btnCompare').addEventListener('click', () => setCompare(split < 0));
-$('#btnShutter').addEventListener('click', snap);
-$('#btnRec').addEventListener('click', toggleRec);
+$('#btnShutter').addEventListener('click', () => withTimer(snap));
+$('#btnRec').addEventListener('click', recPress);
+$('#btnTimer').addEventListener('click', cycleTimer);
 $('#btnShuffle').addEventListener('click', surprise);
 $('#btnFull').addEventListener('click', () => {
   if(document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -2157,10 +2715,12 @@ document.addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if(k === 'arrowright' || k === 'arrowdown'){ if(e.target.closest('.seg, .tabs')) return; e.preventDefault(); step(1); }
   else if(k === 'arrowleft' || k === 'arrowup'){ if(e.target.closest('.seg, .tabs')) return; e.preventDefault(); step(-1); }
-  else if(k === ' '){ if(e.target.closest('button')) return; e.preventDefault(); snap(); }
+  else if(k === ' '){ if(e.target.closest('button')) return; e.preventDefault(); withTimer(snap); }
   else if(k === 'c') setCompare(split < 0);
   else if(k === 'm'){ mirror = !mirror; syncSourceUI(); }
-  else if(k === 'r') toggleRec();
+  else if(k === 'r') recPress();
+  else if(k === 't') cycleTimer();
+  else if(k === 'escape') cancelCountdown();
   else if(k === 's') surprise();
   else if(k === 'f') $('#btnFull').click();
 });
@@ -2223,7 +2783,7 @@ function frame(now){
   runFilter(active, W, H, outT[oc^1], outF[oc]);
   // 4. composite to screen
   gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H);
-  blitTo(outT[oc], bgOf(active), split, W, H);
+  blitTo(outT[oc], bgOf(active), split, W, H, active.mix);
 
   frameNo++; fpsN++;
   if(now - fpsT > 500){
