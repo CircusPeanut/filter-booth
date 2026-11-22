@@ -273,7 +273,7 @@ kbd{font:500 10.5px var(--f-mono);border:1px solid var(--line);border-bottom-wid
 <div class="sheet" id="sessSheet" hidden role="dialog" aria-modal="true" aria-labelledby="sessTitle">
   <div class="sheet-card">
     <h3 id="sessTitle">Pose session</h3>
-    <p class="sheet-sub">Hands-free shooting. After a get-ready countdown, every beep captures the same moment in each filter you pick. Then it counts down 3, 2, 1 to the next pose. Photos go to the camera roll, and Save all downloads them as one ZIP.</p>
+    <p class="sheet-sub">Hands-free shooting. After a get-ready countdown, every beep captures the same moment in each filter you pick. Then it counts down 3, 2, 1 to the next pose. Photos go to the camera roll and are kept on this device until you clear them, even if the page closes. With auto-save on, the session downloads as one ZIP the moment it ends.</p>
     <div class="sheet-row">
       <div class="sheet-head"><span class="sheet-lbl">Filters<output id="sessCount"></output></span><span class="sheet-links"><button type="button" id="sessDefaults">Suggested</button><button type="button" id="sessNone">None</button></span></div>
       <div class="chips" id="sessChips"></div>
@@ -283,6 +283,7 @@ kbd{font:500 10.5px var(--f-mono);border:1px solid var(--line);border-bottom-wid
       <div class="sheet-row"><span class="sheet-lbl">Time between poses</span><div class="seg" id="sessGap"></div></div>
       <div class="sheet-row"><span class="sheet-lbl">Poses</span><div class="seg" id="sessPoses"></div></div>
       <div class="sheet-row"><span class="sheet-lbl">Beeps</span><div class="seg" id="sessSound"></div></div>
+      <div class="sheet-row"><span class="sheet-lbl">Auto-save</span><div class="seg" id="sessAuto"></div></div>
     </div>
     <div class="sheet-foot"><button type="button" id="sessCancel">Cancel</button><button type="button" class="primary" id="sessStart">Start session</button></div>
   </div>
@@ -2637,7 +2638,33 @@ const rollEl = $('#rollItems');
 let shots = 0;
 const stamp = () => { const d = new Date(), z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth()+1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`; };
 const rollFiles = [];
-function addShot(blobData, kind, extra, f = active, nameHint = ''){
+// Every shot is also kept in IndexedDB until the roll is cleared, so a reload, a closed tab or a
+// download that never happened can't lose a session. Failures here are silent: the roll still works.
+const vault = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    if(!('indexedDB' in window)){ rej(new Error('IndexedDB unavailable')); return; }
+    const r = indexedDB.open('filterbooth', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('shots', {keyPath: 'id', autoIncrement: true});
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = (mode, fn) => open().then(db => new Promise((res, rej) => {
+    const t = db.transaction('shots', mode), req = fn(t.objectStore('shots'));
+    t.oncomplete = () => res(req ? req.result : undefined);
+    t.onerror = t.onabort = () => rej(t.error);
+  }));
+  return {
+    add: rec => run('readwrite', s => s.add(rec)).catch(() => null),
+    all: () => run('readonly', s => s.getAll()).catch(() => []),
+    remove: ids => run('readwrite', s => { ids.forEach(id => s.delete(id)); }).catch(() => {}),
+    markSaved: ids => run('readwrite', s => {
+      ids.forEach(id => { const g = s.get(id); g.onsuccess = () => { if(g.result){ g.result.saved = true; s.put(g.result); } }; });
+    }).catch(() => {}),
+    clear: () => run('readwrite', s => s.clear()).catch(() => {})
+  };
+})();
+function addShot(blobData, kind, extra, f = active, nameHint = '', opts = {}){
   if(shots === 0) rollEl.innerHTML = '';
   shots++;
   const url = URL.createObjectURL(blobData);
@@ -2645,7 +2672,13 @@ function addShot(blobData, kind, extra, f = active, nameHint = ''){
   const ext = kind === 'photo' ? 'jpg' : (blobData.type.includes('mp4') ? 'mp4' : 'webm');
   a.download = nameHint || `filter-booth-${f.id}-${stamp()}.${ext}`;
   a.title = 'Save ' + a.download;
-  rollFiles.push({name: a.download, blob: blobData});
+  const rec = {name: a.download, blob: blobData, kind, extra: extra || '', filterId: f.id, filterName: f.name,
+    session: opts.session || null, t: opts.t || Date.now(), saved: !!opts.saved, vid: opts.vid || null};
+  rollFiles.push(rec);
+  if(!opts.restored && blobData.size < 150e6){   // very long clips stay in memory only
+    const {vid, ...keep} = rec;
+    rec.stored = vault.add(keep).then(id => { rec.vid = id; return id; });
+  }
   let media;
   if(kind === 'photo'){ media = document.createElement('img'); media.alt = f.name + ' photo'; }
   else { media = document.createElement('video'); media.muted = true; media.loop = true; media.autoplay = true; media.playsInline = true; }
@@ -2671,6 +2704,7 @@ $('#clearRoll').addEventListener('click', () => {
   rollEl.innerHTML = '<div class="slot"></div><div class="slot"></div><div class="slot"></div>';
   shots = 0; $('#clearRoll').hidden = true;
   rollFiles.length = 0; $('#saveAll').hidden = true;
+  vault.clear();
   $('#rollHint').textContent = 'Photos and clips you take land here. Click one to save it.';
 });
 
@@ -2746,7 +2780,7 @@ syncTimer();
 const stillOK = f => !f.fb && !f.hist;     // filters that need several frames can't make a still
 const SESSION_SUGGESTED = ['original','edgeascii','painterly','lifedraw','flowink','silver','chiaro','rimlight'];
 const SESSION_MAX = 50;                    // cap for "until I stop", to keep memory in check
-const sessOpts = Object.assign({poses:10, gap:5, lead:10, sound:true}, store.get('sessionOpts', {}));
+const sessOpts = Object.assign({poses:10, gap:5, lead:10, sound:true, autosave:true}, store.get('sessionOpts', {}));
 let sessSel = new Set((store.get('sessionSel', null) || SESSION_SUGGESTED).filter(id => byId[id] && stillOK(byId[id])));
 let sess = null, actx = null;
 
@@ -2822,6 +2856,7 @@ function buildSheet(){
   segGroup($('#sessGap'), [3, 5, 8, 12], 'gap', v => v + ' s');
   segGroup($('#sessPoses'), [5, 10, 20, 0], 'poses', v => v ? String(v) : 'Until I stop');
   segGroup($('#sessSound'), [true, false], 'sound', v => v ? 'On' : 'Off');
+  segGroup($('#sessAuto'), [true, false], 'autosave', v => v ? 'ZIP when it ends' : 'Off');
   saveSel();
 }
 function openSheet(){
@@ -2838,7 +2873,7 @@ function startSession(){
   $('#sessSheet').hidden = true;
   cancelCountdown();
   audioUnlock();
-  sess = {list, n: sessOpts.poses || SESSION_MAX, done: 0, left: sessOpts.lead, phase: 'ready', iv: 0, id: stamp()};
+  sess = {list, n: sessOpts.poses || SESSION_MAX, done: 0, left: sessOpts.lead, phase: 'ready', iv: 0, id: stamp(), pending: [], failed: 0};
   syncSession();
   sessionShow();
   sess.iv = setInterval(sessionTick, 1000);
@@ -2866,7 +2901,12 @@ function sessionTick(){
   blitTo(outT[oc], bgOf(active), split, W, H, active.mix);
   const fl = $('#flash'); fl.classList.remove('go'); void fl.offsetWidth; fl.classList.add('go');
   stills.forEach(([f, c]) => {
-    if(c) c.toBlob(b => { if(b) addShot(b, 'photo', `Pose ${pose}`, f, `session-${s.id}_pose-${tag}_${f.id}.jpg`); }, 'image/jpeg', .92);
+    if(!c){ s.failed++; return; }
+    s.pending.push(new Promise(res => c.toBlob(b => {
+      if(b) addShot(b, 'photo', `Pose ${pose}`, f, `session-${s.id}_pose-${tag}_${f.id}.jpg`, {session: s.id});
+      else s.failed++;
+      res();
+    }, 'image/jpeg', .92)));
   });
   if(pose >= s.n){ endSession(true); return; }
   s.phase = 'pose'; s.left = sessOpts.gap;
@@ -2875,10 +2915,20 @@ function sessionTick(){
 function endSession(finished){
   if(!sess) return;
   clearInterval(sess.iv);
-  const n = sess.done, per = sess.list.length;
+  const s = sess, n = s.done;
   sess = null;
   hideCount(); syncSession();
-  toast(n ? `${finished ? 'Session done' : 'Session stopped'}: ${n} pose${n === 1 ? '' : 's'}, ${n*per} photos in the camera roll. Save all downloads them as one ZIP.` : 'Session stopped.', 6500);
+  if(!n){ toast('Session stopped.'); return; }
+  const head = `${finished ? 'Session done' : 'Session stopped'}: ${n} pose${n === 1 ? '' : 's'}`;
+  Promise.all(s.pending).then(() => {
+    const files = rollFiles.filter(r => r.session === s.id);
+    const lost = s.failed ? ` ${s.failed} photo${s.failed === 1 ? '' : 's'} couldn’t be made.` : '';
+    if(!sessOpts.autosave){
+      toast(`${head}, ${files.length} photos in the camera roll.${lost} Save all downloads them as one ZIP.`, 6500);
+      return;
+    }
+    return saveFiles(files, `session-${s.id}.zip`, `${head}.${lost}`);
+  });
 }
 
 // Save all: one ZIP (stored, no compression; JPEGs don't shrink further) built in the browser.
@@ -2920,12 +2970,38 @@ function saveBlob(blob, name){
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(u), 60000);
 }
-async function saveAll(){
-  if(!rollFiles.length) return;
-  if(rollFiles.length === 1){ saveBlob(rollFiles[0].blob, rollFiles[0].name); return; }
-  toast(`Packing ${rollFiles.length} files into a ZIP…`, 2500);
-  try { saveBlob(await makeZip(rollFiles), `filter-booth-${stamp()}.zip`); }
-  catch(e){ toast('The ZIP couldn’t be made: ' + (e.message || e)); }
+// Download files (one as itself, several as a ZIP) and mark them saved in the vault.
+// The browser gives no signal when a download is blocked, so the vault keeps them either way.
+async function saveFiles(files, zipName, lead = ''){
+  if(!files.length) return;
+  try {
+    if(files.length === 1) saveBlob(files[0].blob, files[0].name);
+    else {
+      toast(`${lead ? lead + ' ' : ''}Packing ${files.length} photos into a ZIP…`, 2500);
+      saveBlob(await makeZip(files), zipName);
+    }
+  } catch(e){ toast('The ZIP couldn’t be made: ' + (e.message || e) + '. Your photos are still in the camera roll.', 8000); return; }
+  const ids = (await Promise.all(files.map(r => r.vid || r.stored))).filter(Boolean);
+  files.forEach(r => { r.saved = true; });
+  vault.markSaved(ids);
+  toast(`${lead ? lead + ' ' : ''}Saved ${files.length === 1 ? files[0].name : zipName} to Downloads. The photos stay in the camera roll until you tap Clear.`, 8000);
+}
+function saveAll(){ return saveFiles(rollFiles.slice(), `filter-booth-${stamp()}.zip`); }
+
+// On load, put back anything still in the vault. Saved photos older than 3 days are dropped.
+async function restoreVault(){
+  const recs = await vault.all();
+  if(!recs.length) return;
+  const old = Date.now() - 3 * 864e5;
+  const drop = recs.filter(r => r.saved && r.t < old).map(r => r.id);
+  if(drop.length) vault.remove(drop);
+  const keep = recs.filter(r => !(r.saved && r.t < old) && r.blob).sort((a, b) => a.t - b.t);
+  if(!keep.length) return;
+  keep.forEach(r => addShot(r.blob, r.kind || 'photo', r.extra, byId[r.filterId] || {id: r.filterId, name: r.filterName || 'Photo'},
+    r.name, {restored: true, session: r.session, t: r.t, saved: r.saved, vid: r.id}));
+  const unsaved = keep.filter(r => !r.saved).length;
+  toast(`Restored ${keep.length} photo${keep.length === 1 ? '' : 's'} from before the page closed` +
+    (unsaved ? `, ${unsaved} not downloaded yet. Tap Save all to download them.` : '.'), 9000);
 }
 
 /* ================= wiring ================= */
@@ -2946,7 +3022,8 @@ $('#sessStart').addEventListener('click', startSession);
 $('#sessSheet').addEventListener('click', e => { if(e.target === e.currentTarget) closeSheet(); });
 $('#sessDefaults').addEventListener('click', () => { sessSel = new Set(SESSION_SUGGESTED.filter(id => byId[id] && stillOK(byId[id]))); buildSheet(); });
 $('#sessNone').addEventListener('click', () => { sessSel.clear(); buildSheet(); });
-$('#saveAll').addEventListener('click', saveAll);
+$('#saveAll').addEventListener('click', () => saveAll());
+restoreVault();
 $('#btnShuffle').addEventListener('click', surprise);
 $('#btnFull').addEventListener('click', () => {
   if(document.fullscreenElement) document.exitFullscreen().catch(() => {});
